@@ -130,7 +130,7 @@ async def health():
 
 
 @app.get("/api")
-async def torznab_api(
+def torznab_api(
     request: Request,
     # ---- mandatory ----
     t: str = Query(..., description="Torznab function type"),
