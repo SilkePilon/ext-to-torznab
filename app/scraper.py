@@ -338,7 +338,7 @@ class ExtToScraper:
             logger.warning("ext.to returned a Cloudflare error page")
             return []
 
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         table = soup.select_one("table.table-striped")
         if not table:
             logger.warning("Result table not found. Snippet: %s", html[:400].replace("\n", " "))
@@ -647,7 +647,7 @@ class ExtToScraper:
 
         # Fallback: button element (works on some page variants)
         if not torrent_id:
-            soup = BeautifulSoup(html, "lxml")
+            soup = BeautifulSoup(html, "html.parser")
             magnet_btn = soup.select_one("a.search-magnet-btn[data-id]")
             if magnet_btn:
                 try:
