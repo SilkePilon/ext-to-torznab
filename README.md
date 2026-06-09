@@ -12,17 +12,17 @@ application that supports the Newznab/Torznab API.
 
 ## Features
 
-| Feature               | Details                                                           |
-| --------------------- | ----------------------------------------------------------------- |
-| Torznab-compliant API | `caps`, `search`, `tvsearch`, `movie`, `music`, `book`            |
-| Full category support | All ext.to categories mapped to Torznab IDs                       |
-| TV search             | Query + season + episode auto-formatted (`S01E03`)                |
-| IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to            |
-| Magnet links          | Resolved on-demand via FlareSolverr — search returns instantly    |
-| Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                           |
-| Optional API key      | Protect the proxy with `API_KEY` environment variable             |
-| Pagination            | Full `offset` / `limit` support                                   |
-| Docker-ready          | Single `docker compose up -d`                                     |
+| Feature               | Details                                                        |
+| --------------------- | -------------------------------------------------------------- |
+| Torznab-compliant API | `caps`, `search`, `tvsearch`, `movie`, `music`, `book`         |
+| Full category support | All ext.to categories mapped to Torznab IDs                    |
+| TV search             | Query + season + episode auto-formatted (`S01E03`)             |
+| IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to         |
+| Magnet links          | Resolved on-demand via FlareSolverr — search returns instantly |
+| Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                        |
+| Optional API key      | Protect the proxy with `API_KEY` environment variable          |
+| Pagination            | Full `offset` / `limit` support                                |
+| Docker-ready          | Single `docker compose up -d`                                  |
 
 ---
 
@@ -155,7 +155,7 @@ Sonarr / Radarr / Lidarr
 ```
 
 Magnet links are resolved **on demand**: search results are returned immediately
-and the magnet URL is fetched only when the *arr app actually grabs a release
+and the magnet URL is fetched only when the \*arr app actually grabs a release
 (via the `t=download` endpoint). This keeps search response times fast even on
 a slow FlareSolverr instance.
 

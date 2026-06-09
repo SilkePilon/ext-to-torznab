@@ -31,7 +31,7 @@ services:
   # ── ext-to-torznab ──────────────────────────────────────────────────────────
   ext-to-torznab:
     image: ghcr.io/silkepilon/ext-to-torznab:latest
-    build: .   # remove this line if you don't want a local build
+    build: . # remove this line if you don't want a local build
     container_name: ext-to-torznab
     depends_on:
       flaresolverr:
