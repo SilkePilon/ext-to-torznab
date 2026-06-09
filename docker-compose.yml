@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ext-to-torznab + FlareSolverr
+#
+# Usage:
+#   docker compose up -d
+#
+# Then add the indexer in Sonarr / Lidarr / Radarr / Prowlarr:
+#   URL:    http://<your-host>:5000
+#   API key: (leave blank, or set API_KEY below)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── FlareSolverr ─────────────────────────────────────────────────────────
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      # Uncomment if you need to adjust the browser start URL for your region:
+      # - TEST_URL=https://www.google.com
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8191/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── ext-to-torznab ──────────────────────────────────────────────────────────
+  ext-to-torznab:
+    image: ghcr.io/silkepilon/ext-to-torznab:latest
+    build: .   # remove this line if you don't want a local build
+    container_name: ext-to-torznab
+    depends_on:
+      flaresolverr:
+        condition: service_started
+    ports:
+      - "5000:5000"
+    environment:
+      # URL of the FlareSolverr instance (use the service name when both
+      # containers are in the same compose network)
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+
+      # Optionally override the ext.to URL with a mirror
+      - EXT_TO_URL=https://ext.to
+
+      # Set a non-empty value to require ?apikey=<VALUE> on all requests
+      - API_KEY=
+
+      # Include XXX / adult categories in results  (true/false)
+      - INCLUDE_ADULT=true
+
+      # Max time (ms) FlareSolverr is allowed to solve a challenge
+      - FLARESOLVERR_TIMEOUT=60000
+
+      # Logging verbosity  (DEBUG / INFO / WARNING / ERROR)
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5000/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
