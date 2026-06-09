@@ -20,6 +20,7 @@ application that supports the Newznab/Torznab API.
 | IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to         |
 | Magnet links          | Resolved on-demand via FlareSolverr — search returns instantly |
 | Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                        |
+| Turnstile bypass      | `FLARESOLVERR_TABS_TILL_VERIFY` hint for Cloudflare Turnstile  |
 | Optional API key      | Protect the proxy with `API_KEY` environment variable          |
 | Pagination            | Full `offset` / `limit` support                                |
 | Docker-ready          | Single `docker compose up -d`                                  |
@@ -59,6 +60,7 @@ services:
       - API_KEY=
       - INCLUDE_ADULT=true
       - FLARESOLVERR_TIMEOUT=60000
+      - FLARESOLVERR_TABS_TILL_VERIFY=0
       - LOG_LEVEL=INFO
     restart: unless-stopped
 ```
@@ -100,16 +102,17 @@ curl "http://localhost:5000/api?t=search&q=ubuntu"
 
 ## Configuration
 
-| Variable               | Default                    | Description                              |
-| ---------------------- | -------------------------- | ---------------------------------------- |
-| `FLARESOLVERR_URL`     | `http://flaresolverr:8191` | URL of the FlareSolverr instance         |
-| `EXT_TO_URL`           | `https://ext.to`           | ext.to base URL (set a mirror if needed) |
-| `API_KEY`              | _(empty)_                  | Optional key required on all requests    |
-| `PORT`                 | `5000`                     | Port the proxy listens on                |
-| `HOST`                 | `0.0.0.0`                  | Bind address                             |
-| `FLARESOLVERR_TIMEOUT` | `60000`                    | Max ms FlareSolverr waits per page       |
-| `INCLUDE_ADULT`        | `true`                     | Include XXX categories in results        |
-| `LOG_LEVEL`            | `INFO`                     | Logging verbosity                        |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FLARESOLVERR_URL` | `http://flaresolverr:8191` | URL of the FlareSolverr instance |
+| `EXT_TO_URL` | `https://ext.to` | ext.to base URL (set a mirror if needed) |
+| `API_KEY` | _(empty)_ | Optional key required on all requests |
+| `PORT` | `5000` | Port the proxy listens on |
+| `HOST` | `0.0.0.0` | Bind address |
+| `FLARESOLVERR_TIMEOUT` | `60000` | Max ms FlareSolverr waits per page |
+| `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges) |
+| `INCLUDE_ADULT` | `true` | Include XXX categories in results |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 ---
 
