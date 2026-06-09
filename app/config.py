@@ -18,6 +18,9 @@ class Config:
     # Timeout for FlareSolverr requests in milliseconds
     FLARESOLVERR_TIMEOUT: int = int(os.environ.get("FLARESOLVERR_TIMEOUT", "60000"))
 
+    # Tabs-till-verify hint for FlareSolverr Turnstile bypass (0 = disabled)
+    FLARESOLVERR_TABS_TILL_VERIFY: int = int(os.environ.get("FLARESOLVERR_TABS_TILL_VERIFY", "0"))
+
     # Whether to include adult (XXX) content in results
     INCLUDE_ADULT: bool = os.environ.get("INCLUDE_ADULT", "true").lower() == "true"
 

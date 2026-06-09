@@ -64,7 +64,9 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     logger.info("═══════════════════════════════════════")
 
     _fs_client = FlareSolverrClient(
-        config.FLARESOLVERR_URL, config.FLARESOLVERR_TIMEOUT
+        config.FLARESOLVERR_URL,
+        config.FLARESOLVERR_TIMEOUT,
+        tabs_till_verify=config.FLARESOLVERR_TABS_TILL_VERIFY,
     )
     _scraper = ExtToScraper(config.EXT_TO_URL, _fs_client, config.INCLUDE_ADULT)
 

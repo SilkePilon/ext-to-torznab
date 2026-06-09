@@ -35,10 +35,11 @@ class FlareSolverrClient:
         load.  Also used (+ 15 s buffer) as the HTTP connect/read timeout.
     """
 
-    def __init__(self, base_url: str, timeout_ms: int = 60_000) -> None:
+    def __init__(self, base_url: str, timeout_ms: int = 60_000, tabs_till_verify: int = 0) -> None:
         self._api_url = base_url.rstrip("/") + "/v1"
         self._timeout_ms = timeout_ms
         self._http_timeout = timeout_ms / 1_000 + 15
+        self._tabs_till_verify = tabs_till_verify
         self._session_id: Optional[str] = None
         # Serialise session creation/destruction so concurrent threads can't
         # race and create multiple browser sessions simultaneously.
@@ -129,6 +130,8 @@ class FlareSolverrClient:
             "maxTimeout": self._timeout_ms,
             "session": self._session_id,
         }
+        if self._tabs_till_verify > 0:
+            payload["tabs_till_verify"] = self._tabs_till_verify
         try:
             result = self._post(payload)
         except FlareSolverrError:
