@@ -5,6 +5,9 @@ FROM python:3.11-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     curl \
+    gcc \
+    libxml2-dev \
+    libxslt1-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Working directory ────────────────────────────────────────────────────────
@@ -20,7 +23,6 @@ COPY app/ ./app/
 # ── Runtime defaults (all overridable via env / docker-compose) ──────────────
 ENV FLARESOLVERR_URL=http://flaresolverr:8191 \
     EXT_TO_URL=https://ext.to \
-    API_KEY="" \
     PORT=5000 \
     HOST=0.0.0.0 \
     FLARESOLVERR_TIMEOUT=60000 \
