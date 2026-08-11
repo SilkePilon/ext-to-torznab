@@ -14,6 +14,7 @@ Supported functions (t= parameter):
 """
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -21,8 +22,9 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import RedirectResponse, Response
 
 from .config import config
-from .flaresolverr_client import FlareSolverrClient, FlareSolverrError
+from .flaresolverr_client import FlareSolverrClient
 from .scraper import ExtToScraper
+from .site_client import SitePool, SiteUnavailable
 from .torznab import (
     build_caps_response,
     build_error_response,
@@ -42,6 +44,7 @@ logger = logging.getLogger(__name__)
 # Global singletons (created in lifespan)
 # ---------------------------------------------------------------------------
 _fs_client: Optional[FlareSolverrClient] = None
+_pool: Optional[SitePool] = None
 _scraper: Optional[ExtToScraper] = None
 
 _XML_CT = "application/rss+xml; charset=UTF-8"
@@ -53,28 +56,68 @@ _SEARCH_FUNCTIONS = {"search", "tvsearch", "movie", "music", "book"}
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    global _fs_client, _scraper
+    global _fs_client, _pool, _scraper
 
     logger.info("═══════════════════════════════════════")
     logger.info("  EXT Torrents Torznab Proxy starting  ")
-    logger.info("  FlareSolverr : %s", config.FLARESOLVERR_URL)
-    logger.info("  ext.to URL   : %s", config.EXT_TO_URL)
+    logger.info("  FlareSolverr : %s", config.FLARESOLVERR_URL or "(disabled)")
+    logger.info("  Mirrors      : %s", ", ".join(config.EXT_TO_URLS))
+    logger.info("  Direct first : %s", config.PREFER_DIRECT)
+    logger.info("  Magnets      : %s", config.RESOLVE_MAGNETS)
     logger.info("  Include adult: %s", config.INCLUDE_ADULT)
     logger.info("  API key set  : %s", bool(config.API_KEY))
     logger.info("═══════════════════════════════════════")
 
-    _fs_client = FlareSolverrClient(
-        config.FLARESOLVERR_URL,
-        config.FLARESOLVERR_TIMEOUT,
-        tabs_till_verify=config.FLARESOLVERR_TABS_TILL_VERIFY,
+    _fs_client = (
+        FlareSolverrClient(
+            config.FLARESOLVERR_URL,
+            config.FLARESOLVERR_TIMEOUT,
+            tabs_till_verify=config.FLARESOLVERR_TABS_TILL_VERIFY,
+        )
+        if config.FLARESOLVERR_URL
+        else None
     )
-    _scraper = ExtToScraper(config.EXT_TO_URL, _fs_client, config.INCLUDE_ADULT)
+    _pool = SitePool(
+        config.EXT_TO_URLS,
+        _fs_client,
+        timeout=config.HTTP_TIMEOUT,
+        prefer_direct=config.PREFER_DIRECT,
+        cooldown=config.MIRROR_COOLDOWN,
+    )
+    _scraper = ExtToScraper(
+        _pool,
+        include_adult=config.INCLUDE_ADULT,
+        resolve_magnets=config.RESOLVE_MAGNETS,
+        magnet_workers=config.MAGNET_WORKERS,
+        magnet_workers_flaresolverr=config.MAGNET_WORKERS_FLARESOLVERR,
+        magnet_cache_ttl=config.MAGNET_CACHE_TTL,
+        page_cache_ttl=config.PAGE_CACHE_TTL,
+        magnet_max_resolve=config.MAGNET_MAX_RESOLVE,
+    )
+
+    # Pick a working mirror and warm its cookie jar + page tokens in the
+    # background, so the first real search doesn't pay for it.
+    threading.Thread(target=_warm_up, name="warmup", daemon=True).start()
 
     yield
 
     if _fs_client:
         _fs_client.destroy_session()
     logger.info("EXT Torrents Torznab Proxy stopped")
+
+
+def _warm_up() -> None:
+    """Fetch one page so cookies and magnet tokens are ready up front."""
+    try:
+        _html, client = _pool.get("/browse/", {"cat": "2", "sort": "age", "order": "desc"})
+    except SiteUnavailable as exc:
+        logger.warning("Warm-up failed, will retry on first request: %s", exc)
+        return
+    token, _csrf = client.cached_tokens()
+    logger.info(
+        "Warm-up done: %s via %s transport, magnet tokens %s",
+        client.base, client.transport, "ready" if token else "unavailable",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +171,11 @@ async def root():
 
 @app.get("/healthz", include_in_schema=False)
 async def health():
-    return {"status": "ok", "service": "exttorss"}
+    return {
+        "status": "ok",
+        "service": "exttorss",
+        "mirrors": _pool.status() if _pool else [],
+    }
 
 
 @app.get("/api")
@@ -205,10 +252,10 @@ def torznab_api(
                 offset=offset,
                 limit=limit,
             )
-        except FlareSolverrError as exc:
-            logger.error("FlareSolverr error during search: %s", exc)
-            xml = build_error_response(900, f"FlareSolverr error: {exc}")
-            return Response(content=xml, media_type=_XML_CT, status_code=500)
+        except SiteUnavailable as exc:
+            logger.error("All mirrors unavailable during search: %s", exc)
+            xml = build_error_response(900, f"Site unavailable: {exc}")
+            return Response(content=xml, media_type=_XML_CT, status_code=503)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected error during search: %s", exc)
             xml = build_error_response(900, f"Internal error: {exc}")
@@ -228,17 +275,22 @@ def torznab_api(
         if guid.startswith("magnet:"):
             return RedirectResponse(url=guid, status_code=302)
 
-        # Try to resolve a magnet link from the guid (detail page or infohash URL)
-        magnet = _scraper.fetch_magnet_for_guid(guid)
+        # Resolve a magnet link from the guid (cache → magnet API → detail page)
+        try:
+            magnet = _scraper.fetch_magnet_for_guid(guid)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("t=download failed for %s: %s", guid, exc)
+            magnet = None
+
         if magnet:
             return RedirectResponse(url=magnet, status_code=302)
 
-        # Last resort: redirect to the guid itself so the client can try
-        if guid.startswith("http"):
-            return RedirectResponse(url=guid, status_code=302)
-
-        xml = build_error_response(300, "Could not resolve download URL")
-        return Response(content=xml, media_type=_XML_CT, status_code=404)
+        # Never redirect to the HTML detail page: *arr apps treat the returned
+        # page as a corrupt .torrent file and fail the grab.  A 503 tells them
+        # to retry instead, which is what actually recovers.
+        logger.error("t=download: no magnet for %s", guid)
+        xml = build_error_response(900, "Could not resolve magnet link, please retry")
+        return Response(content=xml, media_type=_XML_CT, status_code=503)
 
     # ---- unknown function ----
     xml = build_error_response(202, f"No such function: {t}")

@@ -40,11 +40,18 @@ services:
       - "5000:5000"
     environment:
       # URL of the FlareSolverr instance (use the service name when both
-      # containers are in the same compose network)
+      # containers are in the same compose network).  Only used when a host
+      # answers with a Cloudflare challenge; leave empty to disable it.
       - FLARESOLVERR_URL=http://flaresolverr:8191
 
-      # Optionally override the ext.to URL with a mirror
-      - EXT_TO_URL=https://ext.to
+      # Mirrors tried in order, with automatic failover and cooldown
+      - EXT_TO_URLS=https://extto.com,https://ext.to,https://ext2.to
+
+      # Try plain HTTP before FlareSolverr (roughly 10× faster)
+      - PREFER_DIRECT=true
+
+      # Resolve magnet links during search: auto / always / never
+      - RESOLVE_MAGNETS=auto
 
       # Set a non-empty value to require ?apikey=<VALUE> on all requests
       - API_KEY=

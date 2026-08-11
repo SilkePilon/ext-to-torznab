@@ -1,9 +1,12 @@
 # ext-to-torznab
 
-A **Dockerised Torznab API proxy** that scrapes [ext.to](https://ext.to) through
-[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (to bypass Cloudflare)
-and exposes the results as a standards-compliant
+A **Dockerised Torznab API proxy** that scrapes [ext.to](https://ext.to) (and its
+mirrors) and exposes the results as a standards-compliant
 [Torznab](https://torznab.github.io/spec-1.3-draft/) feed.
+
+Requests go out over plain HTTP whenever a mirror allows it and fall back to
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) only when Cloudflare
+challenges them — the solved cookies are then reused, so the fast path returns.
 
 Works natively with **Sonarr, Lidarr, Radarr, Prowlarr**, and any other
 application that supports the Newznab/Torznab API.
@@ -12,18 +15,20 @@ application that supports the Newznab/Torznab API.
 
 ## Features
 
-| Feature               | Details                                                        |
-| --------------------- | -------------------------------------------------------------- |
-| Torznab-compliant API | `caps`, `search`, `tvsearch`, `movie`, `music`, `book`         |
-| Full category support | All ext.to categories mapped to Torznab IDs                    |
-| TV search             | Query + season + episode auto-formatted (`S01E03`)             |
-| IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to         |
-| Magnet links          | Resolved on-demand via FlareSolverr — search returns instantly |
-| Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                        |
-| Turnstile bypass      | `FLARESOLVERR_TABS_TILL_VERIFY` hint for Cloudflare Turnstile  |
-| Optional API key      | Protect the proxy with `API_KEY` environment variable          |
-| Pagination            | Full `offset` / `limit` support                                |
-| Docker-ready          | Single `docker compose up -d`                                  |
+| Feature               | Details                                                              |
+| --------------------- | -------------------------------------------------------------------- |
+| Torznab-compliant API | `caps`, `search`, `tvsearch`, `movie`, `music`, `book`               |
+| Mirror failover       | `ext.to` → `extto.com` → `ext2.to`, sticky pick + per-host cooldown  |
+| Fast path             | Plain HTTP when a mirror allows it; FlareSolverr only when challenged |
+| Magnet links          | Resolved during search, concurrently, and cached                     |
+| Full category support | All ext.to categories mapped to Torznab IDs, filtered server-side    |
+| TV search             | Query + season + episode auto-formatted (`S01E03`)                   |
+| IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to               |
+| Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                              |
+| Turnstile bypass      | `FLARESOLVERR_TABS_TILL_VERIFY` hint for Cloudflare Turnstile        |
+| Optional API key      | Protect the proxy with `API_KEY` environment variable                |
+| Pagination            | Full `offset` / `limit` support                                      |
+| Docker-ready          | Single `docker compose up -d`                                        |
 
 ---
 
@@ -56,7 +61,9 @@ services:
       - "5000:5000"
     environment:
       - FLARESOLVERR_URL=http://flaresolverr:8191
-      - EXT_TO_URL=https://ext.to
+      - EXT_TO_URLS=https://extto.com,https://ext.to,https://ext2.to
+      - PREFER_DIRECT=true
+      - RESOLVE_MAGNETS=auto
       - API_KEY=
       - INCLUDE_ADULT=true
       - FLARESOLVERR_TIMEOUT=60000
@@ -87,6 +94,13 @@ This starts **two containers**:
 ```bash
 curl "http://localhost:5000/api?t=caps"
 curl "http://localhost:5000/api?t=search&q=ubuntu"
+curl "http://localhost:5000/healthz"      # active mirror + transport
+```
+
+Offline tests (parsing, category mapping, mirror failover):
+
+```bash
+python -m unittest discover -s tests
 ```
 
 ---
@@ -104,8 +118,18 @@ curl "http://localhost:5000/api?t=search&q=ubuntu"
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `FLARESOLVERR_URL` | `http://flaresolverr:8191` | URL of the FlareSolverr instance |
-| `EXT_TO_URL` | `https://ext.to` | ext.to base URL (set a mirror if needed) |
+| `EXT_TO_URLS` | `https://extto.com,https://ext.to,https://ext2.to` | Mirrors tried in order, with failover |
+| `EXT_TO_URL` | _(unset)_ | Single base URL; when set it is tried before `EXT_TO_URLS` |
+| `PREFER_DIRECT` | `true` | Try plain HTTP before FlareSolverr |
+| `FLARESOLVERR_URL` | `http://flaresolverr:8191` | FlareSolverr instance; empty disables it |
+| `HTTP_TIMEOUT` | `20` | Seconds before a plain HTTP request gives up |
+| `MIRROR_COOLDOWN` | `300` | Seconds a failed mirror is skipped |
+| `RESOLVE_MAGNETS` | `auto` | Resolve magnets during search: `auto` (direct transport only), `always`, `never` |
+| `MAGNET_WORKERS` | `8` | Concurrent magnet lookups on the direct transport |
+| `MAGNET_WORKERS_FLARESOLVERR` | `3` | Concurrent magnet lookups through FlareSolverr |
+| `MAGNET_MAX_RESOLVE` | `30` | Magnets resolved per search before the rest go lazy |
+| `MAGNET_CACHE_TTL` | `3600` | Seconds a resolved magnet stays cached |
+| `PAGE_CACHE_TTL` | `120` | Seconds a fetched search page stays cached (`0` disables) |
 | `API_KEY` | _(empty)_ | Optional key required on all requests |
 | `PORT` | `5000` | Port the proxy listens on |
 | `HOST` | `0.0.0.0` | Bind address |
@@ -113,6 +137,9 @@ curl "http://localhost:5000/api?t=search&q=ubuntu"
 | `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges) |
 | `INCLUDE_ADULT` | `true` | Include XXX categories in results |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
+
+`GET /healthz` reports which mirror is active, which transport it uses, and
+which mirrors are in cooldown.
 
 ---
 
@@ -147,20 +174,29 @@ Sonarr / Radarr / Lidarr
         │  GET /api?t=tvsearch&q=...
         ▼
   ext-to-torznab  (FastAPI)
-        │  POST /v1  { cmd: "request.get", url: "https://ext.to/browse/?q=..." }
-        ▼
-  FlareSolverr
-        │  Chrome headless – solves Cloudflare challenge
-        ▼
-  ext.to  (HTML parsed with BeautifulSoup)
+        │
+        ├─ 1. plain HTTPS GET /browse/?q=…      ← fast path (~0.3 s)
+        │      └─ Cloudflare challenge?  → FlareSolverr solves it once,
+        │         its cookies + User Agent are reused for the fast path
+        │      └─ host down?              → next mirror, failed host cooled down
+        │
+        ├─ 2. parse rows with BeautifulSoup
+        │
+        └─ 3. POST /ajax/getSearchMagnet.php ×N (concurrent) → magnet links
         ▼
   Torznab RSS XML  →  returned to *arr
 ```
 
-Magnet links are resolved **on demand**: search results are returned immediately
-and the magnet URL is fetched only when the \*arr app actually grabs a release
-(via the `t=download` endpoint). This keeps search response times fast even on
-a slow FlareSolverr instance.
+**Magnet links** are resolved during the search itself (up to
+`MAGNET_MAX_RESOLVE` per query) and cached, so the \*arr app receives real
+`magnet:` links instead of having to call back through `t=download`. Anything
+left unresolved still works: `t=download` resolves it on demand, retrying with
+a fresh site session on failure.
+
+ext.to allows **60 magnet API calls per PHP session**, then answers "Too many
+requests" until a new session starts. The proxy counts its calls and rotates
+the session before hitting that ceiling — which is what used to make the first
+grab of a release fail while a retry moments later succeeded.
 
 ---
 
