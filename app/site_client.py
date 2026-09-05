@@ -53,6 +53,11 @@ _CHALLENGE_MARKERS = (
 # Cloudflare origin-side errors – the mirror is up but its backend is not.
 _CF_ORIGIN_ERRORS = (520, 521, 522, 523, 524, 525, 526)
 
+# Chromium's own "This site can't be reached" page.  FlareSolverr hands it
+# back as a successful solution (there was no challenge to solve), so it
+# has to be recognised here or it parses as a legitimate empty result page.
+_BROWSER_ERROR_MARKERS = ("main-frame-error", "interstitial-wrapper", "chrome-error://")
+
 # Cookies that identify the ext.to PHP session (dropped when its magnet API
 # quota runs out).  Cloudflare's cf_clearance is deliberately not in here.
 _SITE_SESSION_COOKIES = ("PHPSESSID",)
@@ -62,6 +67,11 @@ _RE_PRE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL)
 
 class SiteUnavailable(Exception):
     """Raised when a host could not be reached through any transport."""
+
+
+def _looks_like_browser_error(body: str) -> bool:
+    head = body[:6000]
+    return any(marker in head for marker in _BROWSER_ERROR_MARKERS)
 
 
 def _looks_like_challenge(status: int, body: str) -> bool:
@@ -229,6 +239,8 @@ class SiteClient:
             html, cookies, user_agent = self._fs.get_page_with_cookies(url)
         except FlareSolverrError as exc:
             raise SiteUnavailable(f"{self.host}: {exc}") from exc
+        if _looks_like_browser_error(html):
+            raise SiteUnavailable(f"{self.host}: browser could not load the page (network error)")
         self._import_browser_state(cookies, user_agent)
         return html
 
@@ -403,6 +415,11 @@ class SitePool:
         ready = [c for c in ordered if self._down_until.get(c.base, 0) <= now]
         cooling = [c for c in ordered if self._down_until.get(c.base, 0) > now]
         return ready + cooling
+
+    def clear_cooldowns(self) -> None:
+        """Forget every cooldown (used after a best-effort warm-up fails)."""
+        with self._lock:
+            self._down_until.clear()
 
     def _mark_down(self, client: SiteClient) -> None:
         with self._lock:

@@ -160,6 +160,33 @@ class ChallengeDetectionTest(unittest.TestCase):
         self.assertFalse(_looks_like_challenge(200, "<table class='table-striped'>"))
 
 
+class BrowserErrorPageTest(unittest.TestCase):
+    """FlareSolverr returns Chromium's network-error page as a 'solution'."""
+
+    CHROME_ERROR = (
+        '<html dir="ltr" lang="en"><head><meta charset="utf-8"><title>ext.to</title></head>'
+        '<body><div id="main-frame-error" class="interstitial-wrapper">'
+        '<div class="error-code">ERR_CONNECTION_TIMED_OUT</div></div></body></html>'
+    )
+
+    def test_flaresolverr_browser_error_is_a_failure(self):
+        from app.site_client import SiteClient, SiteUnavailable
+
+        class FakeFS:
+            def get_page_with_cookies(self, url):
+                return BrowserErrorPageTest.CHROME_ERROR, {}, "UA"
+
+        client = SiteClient("https://ext.to", flaresolverr=FakeFS(), prefer_direct=False)
+        with self.assertRaises(SiteUnavailable):
+            client.get("/browse/")
+
+    def test_real_page_is_not_flagged(self):
+        from app.site_client import _looks_like_browser_error
+
+        self.assertFalse(_looks_like_browser_error(ROW_HTML))
+        self.assertTrue(_looks_like_browser_error(self.CHROME_ERROR))
+
+
 class CategoryTest(unittest.TestCase):
     def test_new_subcategories_are_mapped(self):
         for key, expected in (
@@ -183,6 +210,12 @@ class CategoryTest(unittest.TestCase):
 
 
 class MirrorPoolTest(unittest.TestCase):
+    def test_clear_cooldowns(self):
+        pool = SitePool(["https://a.test", "https://b.test"])
+        pool._mark_down(pool.clients[0])
+        pool.clear_cooldowns()
+        self.assertEqual(pool.status()[0]["cooldown_s"], 0)
+
     def test_duplicates_and_trailing_slashes_are_collapsed(self):
         pool = SitePool(["https://extto.com/", "https://extto.com", "https://ext.to"])
         self.assertEqual([c.base for c in pool.clients], ["https://extto.com", "https://ext.to"])

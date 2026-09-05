@@ -16,6 +16,7 @@ Supported functions (t= parameter):
 import hmac
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -111,18 +112,30 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     logger.info("EXT Torrents Torznab Proxy stopped")
 
 
-def _warm_up() -> None:
-    """Fetch one page so cookies and magnet tokens are ready up front."""
-    try:
-        _html, client = _pool.get("/browse/", {"cat": "2", "sort": "age", "order": "desc"})
-    except SiteUnavailable as exc:
-        logger.warning("Warm-up failed, will retry on first request: %s", exc)
+def _warm_up(attempts: int = 3, delay: float = 20.0) -> None:
+    """Fetch one page so cookies and magnet tokens are ready up front.
+
+    Best effort: right after a pod start the VPN tunnel or FlareSolverr's
+    DNS may not be up yet, and a failed attempt must not leave every mirror
+    in cooldown for the first real search.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            _html, client = _pool.get("/browse/", {"cat": "2", "sort": "age", "order": "desc"})
+        except SiteUnavailable as exc:
+            _pool.clear_cooldowns()
+            if attempt < attempts:
+                logger.warning("Warm-up attempt %d failed (%s); retrying in %.0fs", attempt, exc, delay)
+                time.sleep(delay)
+                continue
+            logger.warning("Warm-up failed, will retry on first request: %s", exc)
+            return
+        token, _csrf = client.cached_tokens()
+        logger.info(
+            "Warm-up done: %s via %s transport, magnet tokens %s",
+            client.base, client.transport, "ready" if token else "unavailable",
+        )
         return
-    token, _csrf = client.cached_tokens()
-    logger.info(
-        "Warm-up done: %s via %s transport, magnet tokens %s",
-        client.base, client.transport, "ready" if token else "unavailable",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +144,7 @@ def _warm_up() -> None:
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
     description="Torznab API proxy that scrapes ext.to via FlareSolverr",
-    version="1.2.2",
+    version="1.2.3",
     lifespan=lifespan,
 )
 
