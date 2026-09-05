@@ -140,6 +140,37 @@ class SessionReplacementTest(unittest.TestCase):
         self.assertEqual(fake.commands().count(("sessions.destroy", "s2")), 0)
         self.assertEqual(fake.commands().count(("sessions.create", None)), 2)
 
+    def test_commands_on_one_session_are_serialised(self):
+        """Concurrent page fetches must not navigate the shared tab at once."""
+        import threading
+        import time
+
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0)
+        active = []
+        overlap = []
+        lock = threading.Lock()
+
+        def fake_post(payload):
+            if payload["cmd"] == "sessions.create":
+                return {"status": "ok", "session": "s1"}
+            with lock:
+                active.append(1)
+                if len(active) > 1:
+                    overlap.append(1)
+            time.sleep(0.05)
+            with lock:
+                active.pop()
+            return {"status": "ok", "solution": {"status": 200, "response": "ok", "cookies": []}}
+
+        client._post = fake_post  # type: ignore[method-assign]
+        threads = [
+            threading.Thread(target=client.get_page_with_cookies, args=(f"https://ext.to/{i}",))
+            for i in range(6)
+        ]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(overlap, [], "request.get commands overlapped on one session")
+
     def test_session_ttl_is_requested(self):
         client = FlareSolverrClient("http://fs.test:8191", session_idle=0, session_ttl_minutes=45)
         fake = _FakeFlareSolverr([_ok(session="s1")])

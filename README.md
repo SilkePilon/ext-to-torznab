@@ -134,7 +134,7 @@ python -m unittest discover -s tests
 | `API_KEY` | _(empty)_ | Optional key required on all requests |
 | `PORT` | `5000` | Port the proxy listens on |
 | `HOST` | `0.0.0.0` | Bind address |
-| `FLARESOLVERR_TIMEOUT` | `60000` | Max ms FlareSolverr waits per page |
+| `FLARESOLVERR_TIMEOUT` | `60000` | Max ms FlareSolverr waits per page. A Turnstile solve measured 27-57 s from a VPN exit; use `120000` when FlareSolverr egresses through a VPN |
 | `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges) |
 | `FLARESOLVERR_SESSION_IDLE` | `300` | Seconds of inactivity before the FlareSolverr browser session is released (0 = keep forever) |
 | `FLARESOLVERR_SESSION_TTL` | `60` | Minutes after which FlareSolverr itself expires our session (`session_ttl_minutes`), so a session orphaned by a crash cannot live forever (0 = disabled) |

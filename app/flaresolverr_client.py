@@ -74,6 +74,11 @@ class FlareSolverrClient:
         # Serialise session creation/destruction so concurrent threads can't
         # race and create multiple browser sessions simultaneously.
         self._session_lock = threading.Lock()
+        # One browser session is one Chromium tab.  Two request.get calls
+        # navigating it at the same time abort each other's challenge solve
+        # ("Timeout after 60 seconds" for both), so commands run one at a time.
+        # Acquired before _session_lock, never the other way round.
+        self._cmd_lock = threading.Lock()
 
         self._session_idle = max(0.0, session_idle)
         self._reaper_interval = max(0.01, reaper_interval)
@@ -237,7 +242,7 @@ class FlareSolverrClient:
         Returns (html, cookies_dict, user_agent).
         Automatically creates/recreates the browser session as needed.
         """
-        with self._using_session():
+        with self._using_session(), self._cmd_lock:
             return self._do_get_with_cookies(url)
 
     def _do_get_with_cookies(self, url: str, retry: bool = True) -> tuple:
@@ -300,7 +305,7 @@ class FlareSolverrClient:
 
         Returns the parsed JSON body of the response.
         """
-        with self._using_session():
+        with self._using_session(), self._cmd_lock:
             return self._do_post_form(url, post_data)
 
     def _do_post_form(self, url: str, post_data: str, retry: bool = True) -> dict:
