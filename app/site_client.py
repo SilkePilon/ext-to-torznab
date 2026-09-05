@@ -80,7 +80,7 @@ class SiteClient:
         flaresolverr: Optional[FlareSolverrClient] = None,
         timeout: int = 20,
         prefer_direct: bool = True,
-        pool_size: int = 16,
+        pool_size: int = 32,
     ) -> None:
         self.base = base_url.rstrip("/")
         self.host = urlsplit(self.base).netloc
@@ -94,6 +94,9 @@ class SiteClient:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         })
+        # Sized for several concurrent searches each running MAGNET_WORKERS
+        # lookups; an overflowing pool discards keep-alive connections and
+        # pays a fresh TLS handshake per magnet POST.
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)

@@ -13,6 +13,7 @@ Supported functions (t= parameter):
   book        – Book search (q)
 """
 
+import hmac
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -63,7 +64,8 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     logger.info("  FlareSolverr : %s", config.FLARESOLVERR_URL or "(disabled)")
     logger.info("  Mirrors      : %s", ", ".join(config.EXT_TO_URLS))
     logger.info("  Direct first : %s", config.PREFER_DIRECT)
-    logger.info("  Magnets      : %s", config.RESOLVE_MAGNETS)
+    logger.info("  Magnets      : %s (%d workers, %.1fs budget)",
+                config.RESOLVE_MAGNETS, config.MAGNET_WORKERS, config.MAGNET_TIME_BUDGET)
     logger.info("  Include adult: %s", config.INCLUDE_ADULT)
     logger.info("  API key set  : %s", bool(config.API_KEY))
     logger.info("═══════════════════════════════════════")
@@ -73,6 +75,8 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             config.FLARESOLVERR_URL,
             config.FLARESOLVERR_TIMEOUT,
             tabs_till_verify=config.FLARESOLVERR_TABS_TILL_VERIFY,
+            session_idle=config.FLARESOLVERR_SESSION_IDLE,
+            session_ttl_minutes=config.FLARESOLVERR_SESSION_TTL,
         )
         if config.FLARESOLVERR_URL
         else None
@@ -93,6 +97,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         magnet_cache_ttl=config.MAGNET_CACHE_TTL,
         page_cache_ttl=config.PAGE_CACHE_TTL,
         magnet_max_resolve=config.MAGNET_MAX_RESOLVE,
+        magnet_time_budget=config.MAGNET_TIME_BUDGET,
     )
 
     # Pick a working mirror and warm its cookie jar + page tokens in the
@@ -102,7 +107,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     yield
 
     if _fs_client:
-        _fs_client.destroy_session()
+        _fs_client.close()
     logger.info("EXT Torrents Torznab Proxy stopped")
 
 
@@ -126,7 +131,7 @@ def _warm_up() -> None:
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
     description="Torznab API proxy that scrapes ext.to via FlareSolverr",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -138,7 +143,7 @@ def _check_key(apikey: Optional[str]) -> bool:
     """Return True if the API key check passes (or no key is configured)."""
     if not config.API_KEY:
         return True
-    return apikey == config.API_KEY
+    return hmac.compare_digest(apikey or "", config.API_KEY)
 
 
 def _parse_cats(cat: Optional[str]) -> list[int]:

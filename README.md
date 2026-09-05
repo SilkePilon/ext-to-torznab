@@ -125,9 +125,10 @@ python -m unittest discover -s tests
 | `HTTP_TIMEOUT` | `20` | Seconds before a plain HTTP request gives up |
 | `MIRROR_COOLDOWN` | `300` | Seconds a failed mirror is skipped |
 | `RESOLVE_MAGNETS` | `auto` | Resolve magnets during search: `auto` (direct transport only), `always`, `never` |
-| `MAGNET_WORKERS` | `8` | Concurrent magnet lookups on the direct transport |
+| `MAGNET_WORKERS` | `12` | Concurrent magnet lookups on the direct transport |
 | `MAGNET_WORKERS_FLARESOLVERR` | `3` | Concurrent magnet lookups through FlareSolverr |
 | `MAGNET_MAX_RESOLVE` | `30` | Magnets resolved per search before the rest go lazy |
+| `MAGNET_TIME_BUDGET` | `5` | Max seconds a search waits for magnets; slower lookups finish in the background and the rows keep their `t=download` link |
 | `MAGNET_CACHE_TTL` | `3600` | Seconds a resolved magnet stays cached |
 | `PAGE_CACHE_TTL` | `120` | Seconds a fetched search page stays cached (`0` disables) |
 | `API_KEY` | _(empty)_ | Optional key required on all requests |
@@ -135,11 +136,55 @@ python -m unittest discover -s tests
 | `HOST` | `0.0.0.0` | Bind address |
 | `FLARESOLVERR_TIMEOUT` | `60000` | Max ms FlareSolverr waits per page |
 | `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges) |
+| `FLARESOLVERR_SESSION_IDLE` | `300` | Seconds of inactivity before the FlareSolverr browser session is released (0 = keep forever) |
+| `FLARESOLVERR_SESSION_TTL` | `60` | Minutes after which FlareSolverr itself expires our session (`session_ttl_minutes`), so a session orphaned by a crash cannot live forever (0 = disabled) |
 | `INCLUDE_ADULT` | `true` | Include XXX categories in results |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 `GET /healthz` reports which mirror is active, which transport it uses, and
 which mirrors are in cooldown.
+
+---
+
+## Performance & memory
+
+Measured September 2026 against the live site (amd64, Docker):
+
+| What | Cost |
+| --- | --- |
+| Search page fetch (`extto.com`, plain HTTP) | ~1.0 s, of which ~0.75 s is the site's own time-to-first-byte for its 1 MB page |
+| Parsing one 50-row page | ~55 ms |
+| Resolving 25 magnets (12 workers) | ~0.5 s |
+| A challenged mirror (`ext.to`, `ext2.to`) through FlareSolverr | ~12 s per solve |
+| Proxy container, idle | ~45 MiB |
+| FlareSolverr container, idle, no browser session | ~40 MiB |
+| FlareSolverr container with an open session | ~285-355 MiB |
+
+The two challenged mirrors reject plain HTTP even with a Chrome TLS fingerprint
+(`curl_cffi`), so a JavaScript challenge solver is still required for them and
+FlareSolverr stays in the stack.  Its cost is kept low instead:
+
+* `extto.com` is tried first and normally answers without a challenge, so most
+  deployments never open a browser.
+* When a challenge *is* solved, the resulting `cf_clearance` cookie is imported
+  into the proxy's own HTTP session and the browser session is released after
+  `FLARESOLVERR_SESSION_IDLE` seconds, dropping FlareSolverr back to ~40-100 MiB.
+* A browser session that errors out (timeout, DNS failure, Turnstile glitch) is
+  destroyed before a replacement is created, and every session carries a
+  `FLARESOLVERR_SESSION_TTL` so FlareSolverr expires anything the proxy loses
+  track of.  Each leaked session is a ~300 MiB Chromium; this is what used to
+  OOM-kill FlareSolverr after a few hours.
+* Search pages are cached as parsed rows (a few KB each), not as raw HTML.
+* Magnet resolution is bounded by `MAGNET_TIME_BUDGET`; anything slower keeps
+  resolving in the background and is served from cache on grab.
+* The image sets `MALLOC_ARENA_MAX=2`.  Without it glibc gives every
+  short-lived worker thread its own heap arena, and the fragmented free space in
+  those arenas made the proxy creep from ~45 MiB to an OOM-kill at 256 MiB over
+  a day (measured: 8 concurrent searches settle at ~270 MiB unbounded versus
+  ~115 MiB with two arenas; `gc.collect()` and `malloc_trim` recover nothing).
+
+If you never need the challenged mirrors, set `FLARESOLVERR_URL=` (empty) and
+drop the `flaresolverr` service from the compose file.
 
 ---
 

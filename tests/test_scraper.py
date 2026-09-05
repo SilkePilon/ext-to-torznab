@@ -18,6 +18,7 @@ from app.scraper import (  # noqa: E402
     _torrent_id_from_url,
 )
 from app.site_client import SitePool, extract_js_tokens, _looks_like_challenge  # noqa: E402
+from app.flaresolverr_client import FlareSolverrClient  # noqa: E402
 
 # One result row in the markup ext.to serves today (August 2026).
 ROW_HTML = """
@@ -190,6 +191,107 @@ class MirrorPoolTest(unittest.TestCase):
         pool = SitePool(["https://a.test", "https://b.test"])
         pool._mark_down(pool.clients[0])
         self.assertEqual(pool.candidates()[0].base, "https://b.test")
+
+
+class PageCacheTest(unittest.TestCase):
+    """The page cache must hold parsed rows, not megabytes of raw HTML."""
+
+    def test_cache_hit_skips_fetch_and_parse(self):
+        scraper = make_scraper()
+        client = scraper.pool.active
+        calls = []
+
+        def fake_get(path, params=None):
+            calls.append((path, params))
+            return ROW_HTML, client
+
+        scraper._pool.get = fake_get  # type: ignore[method-assign]
+        first, _ = scraper._fetch_results("/browse/", {"q": "silo"})
+        second, _ = scraper._fetch_results("/browse/", {"q": "silo"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["torrent_id"], 21152668)
+        # Cached value is the parsed list, not the HTML string.
+        key = ("/browse/", (("q", "silo"),))
+        cached_results, _client = scraper._page_cache.get(key)
+        self.assertIsInstance(cached_results, list)
+
+    def test_cached_results_are_not_mutated_by_enrichment(self):
+        scraper = make_scraper()
+        client = scraper.pool.active
+        scraper._pool.get = lambda path, params=None: (ROW_HTML, client)  # type: ignore[method-assign]
+        results, _ = scraper._fetch_results("/browse/", {"q": "silo"})
+        results[0]["magnet_url"] = "magnet:?xt=urn:btih:abc"
+        again, _ = scraper._fetch_results("/browse/", {"q": "silo"})
+        self.assertEqual(again[0]["magnet_url"], "")
+
+
+class MagnetTimeBudgetTest(unittest.TestCase):
+    def test_slow_lookups_do_not_block_past_budget(self):
+        import time as _time
+
+        scraper = ExtToScraper(
+            SitePool(["https://extto.com"]),
+            magnet_workers=4,
+            magnet_time_budget=0.3,
+        )
+        client = scraper.pool.active
+        client.remember_tokens(
+            '<meta name="csrf-token" content="abc123">'
+            "<script>window.searchPageToken = 'deadbeef';</script>"
+        )
+
+        def slow_post(path, data):
+            _time.sleep(1.0)
+            return {"success": True, "hash": "a" * 40}
+
+        client.post_json = slow_post  # type: ignore[method-assign]
+        items = [
+            {"torrent_id": i, "title": f"t{i}", "magnet_url": "", "download_url": "", "infohash": ""}
+            for i in range(1, 5)
+        ]
+        started = _time.time()
+        scraper._enrich_with_magnets(items, client)
+        elapsed = _time.time() - started
+        self.assertLess(elapsed, 0.9, f"enrichment blocked for {elapsed:.2f}s")
+        self.assertTrue(all(not i["magnet_url"] for i in items))
+        # The workers finish in the background and warm the cache for grabs.
+        _time.sleep(1.2)
+        self.assertTrue(scraper._magnet_cache.get(1))
+
+
+class FlareSolverrIdleSessionTest(unittest.TestCase):
+    def test_idle_session_is_destroyed(self):
+        import time as _time
+
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0.2, reaper_interval=0.05)
+        posted = []
+
+        def fake_post(payload):
+            posted.append(payload["cmd"])
+            if payload["cmd"] == "sessions.create":
+                return {"status": "ok", "session": "s1"}
+            return {"status": "ok"}
+
+        client._post = fake_post  # type: ignore[method-assign]
+        client.create_session()
+        self.assertEqual(client.session_id, "s1")
+        _time.sleep(0.6)
+        self.assertIsNone(client.session_id)
+        self.assertIn("sessions.destroy", posted)
+        client.close()
+
+    def test_session_in_use_is_kept(self):
+        import time as _time
+
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0.2, reaper_interval=0.05)
+        client._post = lambda payload: {"status": "ok", "session": "s1"}  # type: ignore[method-assign]
+        client.create_session()
+        for _ in range(4):
+            _time.sleep(0.1)
+            client.touch()
+        self.assertEqual(client.session_id, "s1")
+        client.close()
 
 
 if __name__ == "__main__":

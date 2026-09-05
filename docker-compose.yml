@@ -62,6 +62,19 @@ services:
       # Max time (ms) FlareSolverr is allowed to solve a challenge
       - FLARESOLVERR_TIMEOUT=60000
 
+      # Release the FlareSolverr browser session after this many idle seconds.
+      # An open session keeps ~250 MB of Chrome resident in the flaresolverr
+      # container; the solved cookies stay with the proxy so nothing is lost.
+      - FLARESOLVERR_SESSION_IDLE=300
+
+      # Let FlareSolverr expire our session on its own after this many minutes
+      # (safety net for sessions orphaned by a crash of this container)
+      - FLARESOLVERR_SESSION_TTL=60
+
+      # Longest a search waits for magnet resolution before answering with the
+      # rows it has (the rest resolve on grab, or in the background)
+      - MAGNET_TIME_BUDGET=5
+
       # Logging verbosity  (DEBUG / INFO / WARNING / ERROR)
       - LOG_LEVEL=INFO
     restart: unless-stopped

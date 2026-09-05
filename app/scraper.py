@@ -42,12 +42,12 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlsplit
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, SoupStrainer, Tag
 
 from .categories import EXT_TO_CAT_MAP, cat_id_matches, torznab_cat_to_site_cat
 from .site_client import SiteClient, SitePool, SiteUnavailable, extract_js_tokens
@@ -75,6 +75,10 @@ _ENRICH_FAILURE_LIMIT = 6
 # How long bulk resolution stays disabled after that.  Individual grabs keep
 # working during the pause – they retry with a fresh session of their own.
 _ENRICH_PAUSE_SECONDS = 120
+
+# Search pages are ~1 MB, two thirds of it filter sidebar and scripts.  Only
+# <table> subtrees are built, which roughly halves parse time and memory.
+_TABLE_ONLY = SoupStrainer("table")
 
 # Pre-compiled regex patterns used in hot paths (parsed 50× per search page).
 _RE_HTML_TAGS      = re.compile(r"<[^>]+>")
@@ -189,6 +193,14 @@ def _torrent_id_from_url(url: str) -> Optional[int]:
         return None
 
 
+def _value_span(td: Tag) -> Optional[Tag]:
+    """First <span> in a cell that is not the mobile "Size"/"Files" label."""
+    for span in td.find_all("span"):
+        if "add-block" not in (span.get("class") or ()):
+            return span
+    return None
+
+
 class _Counter:
     """Thread-safe counter used to abort a batch once the site throttles us."""
 
@@ -260,6 +272,7 @@ class ExtToScraper:
         magnet_cache_ttl: int = 3600,
         page_cache_ttl: int = 120,
         magnet_max_resolve: int = 30,
+        magnet_time_budget: float = 5.0,
     ) -> None:
         self._pool = pool
         self._include_adult = include_adult
@@ -271,6 +284,7 @@ class ExtToScraper:
         self._refresh_locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._max_resolve = max(0, magnet_max_resolve)
+        self._time_budget = magnet_time_budget if magnet_time_budget > 0 else None
         self._enrich_paused_until = 0.0
 
     @property
@@ -307,12 +321,11 @@ class ExtToScraper:
         for page in range(start_page, start_page + pages_needed):
             params = self._build_params(effective_query, page, imdbid, categories)
             try:
-                html, client = self._fetch_page("/browse/", params)
+                page_results, client = self._fetch_results("/browse/", params)
             except SiteUnavailable as exc:
                 logger.error("Search page fetch failed: %s", exc)
                 break
 
-            page_results = self._parse_html(html, client)
             all_results.extend(page_results)
             if len(page_results) < _RESULTS_PER_PAGE:
                 break
@@ -373,18 +386,26 @@ class ExtToScraper:
             params["page"] = str(page)
         return params
 
-    def _fetch_page(self, path: str, params: Dict[str, str]) -> Tuple[str, SiteClient]:
+    def _fetch_results(self, path: str, params: Dict[str, str]) -> Tuple[List[Dict], SiteClient]:
+        """Fetch and parse one search page, caching the *parsed* rows.
+
+        Caching rows instead of the raw page keeps a cache entry at a few KB
+        rather than the ~1 MB of HTML the site serves, and a cache hit skips
+        the parse as well as the fetch.  Callers get copies, so magnet
+        enrichment on one response never leaks into the next.
+        """
         key = (path, tuple(sorted(params.items())))
         cached = self._page_cache.get(key)
         if cached is not None:
-            html, client = cached
+            results, client = cached
             logger.debug("Page cache hit: %s %s", path, params)
-            return html, client
+            return [dict(r) for r in results], client
 
         logger.info("Fetching %s", self._pool.active.url(path, params))
         html, client = self._pool.get(path, params)
-        self._page_cache.set(key, (html, client))
-        return html, client
+        results = self._parse_html(html, client)
+        self._page_cache.set(key, (results, client))
+        return [dict(r) for r in results], client
 
     # -----------------------------------------------------------------------
     # Parsing
@@ -397,8 +418,8 @@ class ExtToScraper:
             logger.warning("Mirror returned a Cloudflare error page")
             return []
 
-        soup = BeautifulSoup(html, "html.parser")
-        table = soup.select_one("table.table-striped")
+        soup = BeautifulSoup(html, "html.parser", parse_only=_TABLE_ONLY)
+        table = soup.find("table", class_="table-striped")
         if not table:
             # A genuine zero-hit search renders the filter sidebar with a
             # "No results" button and no table – not a scraping failure.
@@ -409,8 +430,9 @@ class ExtToScraper:
             return []
 
         base = (client or self._pool.active).base
+        body = table.find("tbody") or table
         results = []
-        for row in table.select("tbody > tr"):
+        for row in body.find_all("tr", recursive=False):
             try:
                 item = self._parse_row(row, base)
                 if item:
@@ -422,11 +444,14 @@ class ExtToScraper:
         return results
 
     def _parse_row(self, row: Tag, base: str) -> Optional[Dict]:
-        td1 = row.select_one("td:nth-child(1)")
-        if not td1:
+        # Plain find()/find_all() here: soupsieve CSS selectors cost ~0.5 ms
+        # per lookup, which added up to ~25 ms per 50-row page.
+        tds = row.find_all("td", recursive=False)
+        if not tds:
             return None
+        td1 = tds[0]
 
-        title_link = td1.select_one("a.torrent-title-link")
+        title_link = td1.find("a", class_="torrent-title-link")
         if not title_link:
             return None
 
@@ -444,7 +469,7 @@ class ExtToScraper:
         # Category: build a lookup key from the related-posted links.
         # Links are [uploader, parent-cat, sub-cat?]; uploader links point at
         # /user/… and are skipped.  Key = parent + sub concatenated.
-        related = td1.select_one("div.related-posted")
+        related = td1.find("div", class_="related-posted")
         cat_id = 8000
         if related:
             cat_links = [
@@ -459,7 +484,7 @@ class ExtToScraper:
             elif len(cat_links) == 1:
                 cat_id = EXT_TO_CAT_MAP.get(cat_links[0], 8000)
 
-        magnet_btn = td1.select_one("a.search-magnet-btn")
+        magnet_btn = td1.find("a", class_="search-magnet-btn")
         torrent_id = None
         if magnet_btn:
             try:
@@ -469,38 +494,41 @@ class ExtToScraper:
         if torrent_id is None:
             torrent_id = _torrent_id_from_url(details_path)
 
+        def cell(index: int) -> Optional[Tag]:
+            return tds[index] if len(tds) > index else None
+
         size = 0
-        td2 = row.select_one("td:nth-child(2)")
+        td2 = cell(1)
         if td2:
-            val = td2.select_one("span:not(.add-block)")
+            val = _value_span(td2)
             if val:
                 size = _parse_size(val.get_text(strip=True))
 
         files = 1
-        td3 = row.select_one("td:nth-child(3)")
+        td3 = cell(2)
         if td3:
-            val = td3.select_one("span:not(.add-block)")
+            val = _value_span(td3)
             if val:
                 files = max(1, _parse_int(val.get_text(strip=True)))
 
         # Date – prefer the exact date carried in the title attribute
         pub_date = ""
-        td4 = row.select_one("td:nth-child(4)")
+        td4 = cell(3)
         if td4:
-            span_t = td4.select_one("span[title]")
+            span_t = td4.find("span", title=True)
             pub_date = _parse_date(span_t["title"] if span_t else td4.get_text(strip=True))
 
         seeders = 0
-        td5 = row.select_one("td:nth-child(5)")
+        td5 = cell(4)
         if td5:
-            val = td5.select_one("span.text-success")
+            val = td5.find("span", class_="text-success")
             if val:
                 seeders = _parse_int(val.get_text(strip=True))
 
         leechers = 0
-        td6 = row.select_one("td:nth-child(6)")
+        td6 = cell(5)
         if td6:
-            val = td6.select_one("span.text-danger")
+            val = td6.find("span", class_="text-danger")
             if val:
                 leechers = _parse_int(val.get_text(strip=True))
 
@@ -692,25 +720,41 @@ class ExtToScraper:
         started = time.time()
         failures = _Counter()
 
-        def worker(item: Dict) -> None:
+        def worker(item: Dict) -> Optional[str]:
             # ext.to throttles bursts of magnet requests.  Once enough calls
             # fail, stop hammering it: the remaining items keep their lazy
             # t=download link, which resolves fine one at a time.
             if failures.value >= _ENRICH_FAILURE_LIMIT:
-                return
+                return None
             magnet = self._request_magnet(client, item["torrent_id"], item.get("title", ""), attempts=2)
-            if magnet:
-                self._apply_magnet(item, magnet)
-            else:
+            if not magnet:
                 failures.increment()
+            return magnet
 
-        with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
-            list(pool.map(worker, pending))
+        # Not a ``with`` block: the executor must not wait for stragglers.
+        # Lookups still running when the budget is spent finish on their own
+        # and land in the magnet cache, so the eventual grab is a cache hit.
+        pool = ThreadPoolExecutor(
+            max_workers=min(workers, len(pending)), thread_name_prefix="magnet"
+        )
+        futures = {pool.submit(worker, item): item for item in pending}
+        done, still_running = wait(futures, timeout=self._time_budget)
+        pool.shutdown(wait=False)
+
+        for future in done:
+            try:
+                magnet = future.result()
+            except Exception as exc:  # noqa: BLE001 – one bad lookup must not sink the response
+                logger.warning("Magnet lookup crashed for id=%s: %s", futures[future].get("torrent_id"), exc)
+                continue
+            if magnet:
+                self._apply_magnet(futures[future], magnet)
 
         resolved = sum(1 for r in results if r.get("magnet_url"))
         logger.info(
-            "Resolved %d/%d magnet links in %.2fs (%s, %d workers)",
+            "Resolved %d/%d magnet links in %.2fs (%s, %d workers%s)",
             resolved, len(results), time.time() - started, client.host, workers,
+            f", {len(still_running)} still resolving in background" if still_running else "",
         )
         if failures.value >= _ENRICH_FAILURE_LIMIT:
             self._enrich_paused_until = time.time() + _ENRICH_PAUSE_SECONDS
