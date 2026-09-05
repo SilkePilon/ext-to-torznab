@@ -726,6 +726,12 @@ class ExtToScraper:
             # t=download link, which resolves fine one at a time.
             if failures.value >= _ENRICH_FAILURE_LIMIT:
                 return None
+            # The batch was started because the transport was direct; if a
+            # challenge flipped it to FlareSolverr mid-batch, don't push the
+            # rest through the browser one POST at a time - that blocks the
+            # shared tab for the next real search.  Grabs still resolve lazily.
+            if self._resolve_mode == "auto" and client.transport != "direct":
+                return None
             magnet = self._request_magnet(client, item["torrent_id"], item.get("title", ""), attempts=2)
             if not magnet:
                 failures.increment()

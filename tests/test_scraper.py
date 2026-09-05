@@ -260,6 +260,27 @@ class MagnetTimeBudgetTest(unittest.TestCase):
         self.assertTrue(scraper._magnet_cache.get(1))
 
 
+class MagnetAutoModeTest(unittest.TestCase):
+    def test_auto_mode_skips_lookups_once_transport_leaves_direct(self):
+        scraper = ExtToScraper(SitePool(["https://extto.com"]), magnet_workers=4)
+        client = scraper.pool.active
+        client.remember_tokens(
+            '<meta name="csrf-token" content="abc123">'
+            "<script>window.searchPageToken = 'deadbeef';</script>"
+        )
+        # Simulate a challenge that pushed the host onto FlareSolverr.
+        client._direct_blocked_until = float("inf")
+        calls = []
+        client.post_json = lambda path, data: calls.append(path) or {"success": True, "hash": "a" * 40}  # type: ignore[method-assign]
+        items = [
+            {"torrent_id": i, "title": f"t{i}", "magnet_url": "", "download_url": "", "infohash": ""}
+            for i in range(1, 5)
+        ]
+        scraper._enrich_with_magnets(items, client)
+        self.assertEqual(calls, [])
+        self.assertTrue(all(not i["magnet_url"] for i in items))
+
+
 class FlareSolverrIdleSessionTest(unittest.TestCase):
     def test_idle_session_is_destroyed(self):
         import time as _time

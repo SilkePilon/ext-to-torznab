@@ -131,7 +131,7 @@ def _warm_up() -> None:
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
     description="Torznab API proxy that scrapes ext.to via FlareSolverr",
-    version="1.2.1",
+    version="1.2.2",
     lifespan=lifespan,
 )
 
