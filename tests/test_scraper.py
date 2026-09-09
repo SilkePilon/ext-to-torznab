@@ -318,7 +318,7 @@ class FlareSolverrIdleSessionTest(unittest.TestCase):
     def test_idle_session_is_destroyed(self):
         import time as _time
 
-        client = FlareSolverrClient("http://fs.test:8191", session_idle=0.2, reaper_interval=0.05)
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0.2, reaper_interval=0.05, backend="flaresolverr")
         posted = []
 
         def fake_post(payload):
@@ -338,7 +338,7 @@ class FlareSolverrIdleSessionTest(unittest.TestCase):
     def test_session_in_use_is_kept(self):
         import time as _time
 
-        client = FlareSolverrClient("http://fs.test:8191", session_idle=0.2, reaper_interval=0.05)
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0.2, reaper_interval=0.05, backend="flaresolverr")
         client._post = lambda payload: {"status": "ok", "session": "s1"}  # type: ignore[method-assign]
         client.create_session()
         for _ in range(4):

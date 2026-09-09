@@ -284,7 +284,20 @@ class SiteClient:
                 return result
 
         if not self._fs:
-            raise SiteUnavailable(f"{self.host}: direct POST failed and FlareSolverr is not configured")
+            raise SiteUnavailable(f"{self.host}: direct POST failed and no solver is configured")
+
+        if not getattr(self._fs, "supports_post", True):
+            # Byparr cannot POST through the browser.  Solve a page instead:
+            # that imports fresh clearance cookies + UA and re-opens the
+            # direct transport, then the POST is retried directly.  The
+            # solved cookies are valid for our own requests because both
+            # egress from the same IP (see flaresolverr.yaml in the homelab).
+            self._flaresolverr_get(self.url("/browse/"))
+            result = self._direct_post(url, data, csrf)
+            if result is not None:
+                return result
+            raise SiteUnavailable(f"{self.host}: direct POST still challenged after a fresh solve")
+
         try:
             return self._fs.post_form(url, urlencode(data))
         except FlareSolverrError as exc:

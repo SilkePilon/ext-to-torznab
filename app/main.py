@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 
     logger.info("═══════════════════════════════════════")
     logger.info("  EXT Torrents Torznab Proxy starting  ")
-    logger.info("  FlareSolverr : %s", config.FLARESOLVERR_URL or "(disabled)")
+    logger.info("  Solver       : %s (%s)", config.FLARESOLVERR_URL or "(disabled)", config.FLARESOLVERR_BACKEND)
     logger.info("  Mirrors      : %s", ", ".join(config.EXT_TO_URLS))
     logger.info("  Direct first : %s", config.PREFER_DIRECT)
     logger.info("  Magnets      : %s (%d workers, %.1fs budget)",
@@ -78,6 +78,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             tabs_till_verify=config.FLARESOLVERR_TABS_TILL_VERIFY,
             session_idle=config.FLARESOLVERR_SESSION_IDLE,
             session_ttl_minutes=config.FLARESOLVERR_SESSION_TTL,
+            backend=config.FLARESOLVERR_BACKEND,
         )
         if config.FLARESOLVERR_URL
         else None
@@ -115,7 +116,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 def _warm_up(attempts: int = 3, delay: float = 20.0) -> None:
     """Fetch one page so cookies and magnet tokens are ready up front.
 
-    Best effort: right after a pod start the VPN tunnel or FlareSolverr's
+    Best effort: right after a pod start the VPN tunnel or the solver's
     DNS may not be up yet, and a failed attempt must not leave every mirror
     in cooldown for the first real search.
     """
@@ -143,8 +144,8 @@ def _warm_up(attempts: int = 3, delay: float = 20.0) -> None:
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
-    description="Torznab API proxy that scrapes ext.to via FlareSolverr",
-    version="1.2.3",
+    description="Torznab API proxy that scrapes ext.to via FlareSolverr or Byparr",
+    version="1.3.0",
     lifespan=lifespan,
 )
 

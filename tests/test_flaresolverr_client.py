@@ -50,7 +50,7 @@ class _FakeFlareSolverr:
 
 class SessionReplacementTest(unittest.TestCase):
     def _client(self, script):
-        client = FlareSolverrClient("http://fs.test:8191", session_idle=0)
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0, backend="flaresolverr")
         fake = _FakeFlareSolverr(script)
         client._http = mock.Mock()
         client._http.post.side_effect = fake
@@ -145,7 +145,7 @@ class SessionReplacementTest(unittest.TestCase):
         import threading
         import time
 
-        client = FlareSolverrClient("http://fs.test:8191", session_idle=0)
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0, backend="flaresolverr")
         active = []
         overlap = []
         lock = threading.Lock()
@@ -172,7 +172,7 @@ class SessionReplacementTest(unittest.TestCase):
         self.assertEqual(overlap, [], "request.get commands overlapped on one session")
 
     def test_session_ttl_is_requested(self):
-        client = FlareSolverrClient("http://fs.test:8191", session_idle=0, session_ttl_minutes=45)
+        client = FlareSolverrClient("http://fs.test:8191", session_idle=0, session_ttl_minutes=45, backend="flaresolverr")
         fake = _FakeFlareSolverr([_ok(session="s1")])
         client._http = mock.Mock()
         client._http.post.side_effect = fake

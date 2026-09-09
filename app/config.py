@@ -30,8 +30,13 @@ def _env_float(name: str, default: float) -> float:
 
 
 class Config:
-    # FlareSolverr external instance URL (leave empty to disable entirely)
+    # Challenge solver URL – FlareSolverr or Byparr (leave empty to disable)
     FLARESOLVERR_URL: str = os.environ.get("FLARESOLVERR_URL", "http://localhost:8191")
+
+    # Which solver speaks at FLARESOLVERR_URL: "flaresolverr" (browser
+    # sessions + request.post), "byparr" (one throw-away browser per call,
+    # no sessions, no browser POST) or "auto" (probe GET / once, lazily).
+    FLARESOLVERR_BACKEND: str = os.environ.get("FLARESOLVERR_BACKEND", "auto").strip().lower()
 
     # Primary base URL for ext.to (kept for backwards compatibility)
     EXT_TO_URL: str = os.environ.get("EXT_TO_URL", "https://ext.to")

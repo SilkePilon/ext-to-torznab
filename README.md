@@ -19,7 +19,8 @@ application that supports the Newznab/Torznab API.
 | --------------------- | -------------------------------------------------------------------- |
 | Torznab-compliant API | `caps`, `search`, `tvsearch`, `movie`, `music`, `book`               |
 | Mirror failover       | `ext.to` → `extto.com` → `ext2.to`, sticky pick + per-host cooldown  |
-| Fast path             | Plain HTTP when a mirror allows it; FlareSolverr only when challenged |
+| Fast path             | Plain HTTP when a mirror allows it; a browser only when challenged   |
+| Solver choice         | FlareSolverr or [Byparr](https://github.com/ThePhaseless/Byparr), auto-detected |
 | Magnet links          | Resolved during search, concurrently, and cached                     |
 | Full category support | All ext.to categories mapped to Torznab IDs, filtered server-side    |
 | TV search             | Query + season + episode auto-formatted (`S01E03`)                   |
@@ -121,7 +122,8 @@ python -m unittest discover -s tests
 | `EXT_TO_URLS` | `https://extto.com,https://ext.to,https://ext2.to` | Mirrors tried in order, with failover |
 | `EXT_TO_URL` | _(unset)_ | Single base URL; when set it is tried before `EXT_TO_URLS` |
 | `PREFER_DIRECT` | `true` | Try plain HTTP before FlareSolverr |
-| `FLARESOLVERR_URL` | `http://flaresolverr:8191` | FlareSolverr instance; empty disables it |
+| `FLARESOLVERR_URL` | `http://flaresolverr:8191` | FlareSolverr or Byparr instance; empty disables it |
+| `FLARESOLVERR_BACKEND` | `auto` | `flaresolverr`, `byparr`, or `auto` (probes `GET /` once: Byparr redirects to `/docs`) |
 | `HTTP_TIMEOUT` | `20` | Seconds before a plain HTTP request gives up |
 | `MIRROR_COOLDOWN` | `300` | Seconds a failed mirror is skipped |
 | `RESOLVE_MAGNETS` | `auto` | Resolve magnets during search: `auto` (direct transport only), `always`, `never` |
@@ -135,9 +137,9 @@ python -m unittest discover -s tests
 | `PORT` | `5000` | Port the proxy listens on |
 | `HOST` | `0.0.0.0` | Bind address |
 | `FLARESOLVERR_TIMEOUT` | `60000` | Max ms FlareSolverr waits per page. A Turnstile solve measured 27-57 s from a VPN exit; use `120000` when FlareSolverr egresses through a VPN |
-| `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges) |
-| `FLARESOLVERR_SESSION_IDLE` | `300` | Seconds of inactivity before the FlareSolverr browser session is released (0 = keep forever) |
-| `FLARESOLVERR_SESSION_TTL` | `60` | Minutes after which FlareSolverr itself expires our session (`session_ttl_minutes`), so a session orphaned by a crash cannot live forever (0 = disabled) |
+| `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges). FlareSolverr only |
+| `FLARESOLVERR_SESSION_IDLE` | `300` | Seconds of inactivity before the FlareSolverr browser session is released (0 = keep forever). FlareSolverr only |
+| `FLARESOLVERR_SESSION_TTL` | `60` | Minutes after which FlareSolverr itself expires our session (`session_ttl_minutes`), so a session orphaned by a crash cannot live forever (0 = disabled). FlareSolverr only |
 | `INCLUDE_ADULT` | `true` | Include XXX categories in results |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
@@ -182,6 +184,25 @@ FlareSolverr stays in the stack.  Its cost is kept low instead:
   those arenas made the proxy creep from ~45 MiB to an OOM-kill at 256 MiB over
   a day (measured: 8 concurrent searches settle at ~270 MiB unbounded versus
   ~115 MiB with two arenas; `gc.collect()` and `malloc_trim` recover nothing).
+
+### Byparr instead of FlareSolverr
+
+[Byparr](https://github.com/ThePhaseless/Byparr) speaks the same `/v1` request
+shape and is picked up automatically (`FLARESOLVERR_BACKEND=auto`), or pin it
+with `FLARESOLVERR_BACKEND=byparr`.  Differences that matter:
+
+* Byparr has no browser sessions: every solve launches a fresh Firefox and
+  closes it again, so `FLARESOLVERR_SESSION_IDLE` / `FLARESOLVERR_SESSION_TTL`
+  / `FLARESOLVERR_TABS_TILL_VERIFY` do nothing.  The solved `cf_clearance`
+  still lands in the proxy's own HTTP session and is reused for every
+  request after that.
+* Byparr cannot POST through the browser.  When a magnet API call is
+  challenged, the proxy solves `/browse/` once to refresh its cookies and
+  retries the POST directly.  For this to work the proxy and Byparr must
+  egress from the same IP (Cloudflare binds the cookie to it) – run them on
+  the same host or in the same pod.
+* Byparr errors arrive as HTTP 408/502 instead of `status: "error"`; the
+  proxy retries once and then marks the mirror down like any other failure.
 
 If you never need the challenged mirrors, set `FLARESOLVERR_URL=` (empty) and
 drop the `flaresolverr` service from the compose file.

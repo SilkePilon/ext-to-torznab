@@ -1,11 +1,22 @@
 """
-FlareSolverr HTTP client with persistent session support.
+Challenge-solver HTTP client (FlareSolverr and Byparr) with persistent
+session support where the backend offers it.
 
-The browser session is created on first use, recreated if it expires, and
-torn down again once it has been idle for a while: an open session keeps a
-Chrome tab alive inside the FlareSolverr container (~250 MB resident), while
-the ``cf_clearance`` cookies it produced live on in our own HTTP session, so
-an idle browser buys nothing.
+Two backends speak the FlareSolverr ``/v1`` request shape:
+
+``flaresolverr``
+    The original.  A browser session is created on first use, recreated if
+    it expires, and torn down again once it has been idle for a while: an
+    open session keeps a Chrome tab alive inside the FlareSolverr container
+    (~250 MB resident), while the ``cf_clearance`` cookies it produced live
+    on in our own HTTP session, so an idle browser buys nothing.  Supports
+    ``request.post``.
+
+``byparr``
+    `Byparr <https://github.com/ThePhaseless/Byparr>`_ accepts the same JSON
+    but ignores ``cmd``, ``session`` and ``postData``: every call is one page
+    load in a throw-away Firefox.  No sessions to manage, and no browser
+    POST – callers must refresh cookies with a page fetch and POST directly.
 """
 
 import json
@@ -22,35 +33,42 @@ import requests
 # that FlareSolverr adds around JSON API responses.
 _RE_PRE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL)
 
+BACKENDS = ("auto", "flaresolverr", "byparr")
+
 logger = logging.getLogger(__name__)
 
 
 class FlareSolverrError(Exception):
-    """Raised when FlareSolverr returns an error or is unreachable."""
+    """Raised when the solver returns an error or is unreachable."""
 
 
 class FlareSolverrClient:
     """
-    Thin wrapper around the FlareSolverr REST API.
+    Thin wrapper around the FlareSolverr REST API (also spoken by Byparr).
 
     Parameters
     ----------
     base_url : str
-        Base URL of the FlareSolverr instance (e.g. ``http://localhost:8191``).
+        Base URL of the solver instance (e.g. ``http://localhost:8191``).
     timeout_ms : int
-        Maximum time in milliseconds FlareSolverr should wait for a page to
+        Maximum time in milliseconds the solver should wait for a page to
         load.  Also used (+ 15 s buffer) as the HTTP connect/read timeout.
     tabs_till_verify : int
         Turnstile bypass hint forwarded to FlareSolverr (0 = not sent).
     session_idle : float
         Seconds without a request after which the browser session is
-        destroyed.  0 keeps it forever.
+        destroyed.  0 keeps it forever.  FlareSolverr only.
     reaper_interval : float
         How often the idle check runs.
     session_ttl_minutes : int
         Forwarded to ``sessions.create`` so FlareSolverr itself expires a
         session we somehow lost track of (0 = not sent).  Defence in depth:
         every orphaned session is a ~300 MB Chromium.
+    backend : str
+        ``"flaresolverr"``, ``"byparr"`` or ``"auto"``.  ``auto`` probes
+        ``GET <base_url>/`` once, lazily: Byparr answers with a redirect to
+        its ``/docs`` (or a JSON ``msg`` naming itself); FlareSolverr answers
+        with a JSON ``msg``.  Anything unrecognised is treated as FlareSolverr.
     """
 
     def __init__(
@@ -61,14 +79,22 @@ class FlareSolverrClient:
         session_idle: float = 300.0,
         reaper_interval: float = 30.0,
         session_ttl_minutes: int = 0,
+        backend: str = "auto",
     ) -> None:
-        self._api_url = base_url.rstrip("/") + "/v1"
+        backend = (backend or "auto").strip().lower()
+        if backend not in BACKENDS:
+            raise ValueError(
+                f"Unknown solver backend {backend!r}; expected one of {', '.join(BACKENDS)}"
+            )
+        self._base_url = base_url.rstrip("/")
+        self._api_url = self._base_url + "/v1"
         self._timeout_ms = timeout_ms
         self._http_timeout = timeout_ms / 1_000 + 15
         self._tabs_till_verify = tabs_till_verify
         self._session_ttl_minutes = max(0, session_ttl_minutes)
         self._session_id: Optional[str] = None
-        # Keep-alive to the FlareSolverr container instead of a new TCP
+        self._backend: Optional[str] = None if backend == "auto" else backend
+        # Keep-alive to the solver container instead of a new TCP
         # connection per command.
         self._http = requests.Session()
         # Serialise session creation/destruction so concurrent threads can't
@@ -77,6 +103,8 @@ class FlareSolverrClient:
         # One browser session is one Chromium tab.  Two request.get calls
         # navigating it at the same time abort each other's challenge solve
         # ("Timeout after 60 seconds" for both), so commands run one at a time.
+        # Byparr launches a browser per call; serialising there keeps its
+        # memory bounded to one Firefox at a time.
         # Acquired before _session_lock, never the other way round.
         self._cmd_lock = threading.Lock()
 
@@ -86,6 +114,49 @@ class FlareSolverrClient:
         self._in_flight = 0
         self._stop = threading.Event()
         self._reaper: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Backend detection
+    # ------------------------------------------------------------------
+
+    @property
+    def backend(self) -> str:
+        """``"flaresolverr"`` or ``"byparr"`` – probed on first use in auto mode."""
+        if self._backend is None:
+            with self._session_lock:
+                if self._backend is None:
+                    self._backend = self._detect_backend()
+        return self._backend
+
+    def _detect_backend(self) -> str:
+        try:
+            resp = self._http.get(self._base_url + "/", timeout=10, allow_redirects=False)
+        except requests.RequestException as exc:
+            raise FlareSolverrError(
+                f"Cannot connect to solver at {self._base_url}: {exc}"
+            ) from exc
+        detected = "flaresolverr"
+        if 300 <= resp.status_code < 400:
+            # Byparr: GET / is a 301 to /docs.
+            detected = "byparr"
+        else:
+            try:
+                msg = str((resp.json() or {}).get("msg", ""))
+            except ValueError:
+                msg = ""
+            if "byparr" in msg.lower():
+                detected = "byparr"
+        logger.info("Solver at %s detected as %s", self._base_url, detected)
+        return detected
+
+    @property
+    def supports_sessions(self) -> bool:
+        return self.backend == "flaresolverr"
+
+    @property
+    def supports_post(self) -> bool:
+        """Whether ``request.post`` can be routed through the browser."""
+        return self.backend == "flaresolverr"
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -103,19 +174,21 @@ class FlareSolverrClient:
             return resp.json()
         except requests.exceptions.ConnectionError as exc:
             raise FlareSolverrError(
-                f"Cannot connect to FlareSolverr at {self._api_url}: {exc}"
+                f"Cannot connect to solver at {self._api_url}: {exc}"
             ) from exc
         except requests.exceptions.Timeout as exc:
             raise FlareSolverrError(
-                f"FlareSolverr request timed out after {self._http_timeout:.0f}s"
+                f"Solver request timed out after {self._http_timeout:.0f}s"
             ) from exc
         except requests.exceptions.HTTPError as exc:
+            # Byparr reports failures this way: 408 on a timed-out solve, 502
+            # when the target is unreachable, with a JSON "detail" body.
             raise FlareSolverrError(
-                f"FlareSolverr HTTP error: {exc.response.status_code} {exc.response.text[:200]}"
+                f"Solver HTTP error: {exc.response.status_code} {exc.response.text[:200]}"
             ) from exc
 
     # ------------------------------------------------------------------
-    # Session management
+    # Session management (FlareSolverr only)
     # ------------------------------------------------------------------
 
     @property
@@ -126,16 +199,21 @@ class FlareSolverrClient:
         """Mark the session as used right now (defers the idle teardown)."""
         self._last_used = time.monotonic()
 
-    def create_session(self) -> str:
-        """Create a new browser session (if none is cached) and return its ID."""
+    def create_session(self) -> Optional[str]:
+        """Create a browser session (if none is cached) and return its ID.
+
+        Returns ``None`` on a backend without sessions.
+        """
         with self._session_lock:
             return self._create_locked()
 
-    def _create_locked(self) -> str:
+    def _create_locked(self) -> Optional[str]:
         """``sessions.create`` – caller must hold ``_session_lock``."""
         # Double-checked: another thread may have already created it.
         if self._session_id:
             return self._session_id
+        if not self.supports_sessions:
+            return None
         payload = {"cmd": "sessions.create"}
         if self._session_ttl_minutes > 0:
             payload["session_ttl_minutes"] = self._session_ttl_minutes
@@ -166,7 +244,7 @@ class FlareSolverrClient:
         finally:
             self._session_id = None
 
-    def _replace_session(self, failed_id: Optional[str]) -> str:
+    def _replace_session(self, failed_id: Optional[str]) -> Optional[str]:
         """Destroy *failed_id* (if it is still the current session) and return a fresh one.
 
         Merely forgetting a broken session ID leaks the Chromium behind it:
@@ -174,6 +252,8 @@ class FlareSolverrClient:
         per transport error fills a 2 GiB container in a few hours.  The
         ``failed_id`` guard keeps two workers that failed on the same session
         from destroying each other's replacement.
+
+        On a session-less backend there is nothing to replace; returns ``None``.
         """
         with self._session_lock:
             if self._session_id and self._session_id == failed_id:
@@ -186,7 +266,8 @@ class FlareSolverrClient:
         self._stop.set()
         if self._reaper is not None:
             self._reaper.join(timeout=2)
-        self.destroy_session()
+        if self._session_id:
+            self.destroy_session()
 
     # -- idle teardown -------------------------------------------------
 
@@ -226,6 +307,14 @@ class FlareSolverrClient:
                 self._in_flight -= 1
                 self.touch()
 
+    def _get_payload(self, cmd: str, url: str) -> dict:
+        payload = {"cmd": cmd, "url": url, "maxTimeout": self._timeout_ms}
+        if self._session_id:
+            payload["session"] = self._session_id
+        if self._tabs_till_verify > 0 and self.supports_sessions:
+            payload["tabs_till_verify"] = self._tabs_till_verify
+        return payload
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -237,7 +326,7 @@ class FlareSolverrClient:
 
     def get_page_with_cookies(self, url: str) -> tuple:
         """
-        Fetch *url* through FlareSolverr.
+        Fetch *url* through the solver.
 
         Returns (html, cookies_dict, user_agent).
         Automatically creates/recreates the browser session as needed.
@@ -246,21 +335,17 @@ class FlareSolverrClient:
             return self._do_get_with_cookies(url)
 
     def _do_get_with_cookies(self, url: str, retry: bool = True) -> tuple:
-        payload = {
-            "cmd": "request.get",
-            "url": url,
-            "maxTimeout": self._timeout_ms,
-            "session": self._session_id,
-        }
-        if self._tabs_till_verify > 0:
-            payload["tabs_till_verify"] = self._tabs_till_verify
-        failed_id = payload["session"]
+        payload = self._get_payload("request.get", url)
+        failed_id = payload.get("session")
         try:
             result = self._post(payload)
         except FlareSolverrError:
             if retry:
-                logger.warning("FlareSolverr error; replacing session and retrying")
-                payload["session"] = self._replace_session(failed_id)
+                logger.warning("Solver error; %s and retrying",
+                               "replacing session" if failed_id else "no session to replace")
+                replacement = self._replace_session(failed_id)
+                if replacement:
+                    payload["session"] = replacement
                 result = self._post(payload)
             else:
                 raise
@@ -268,11 +353,11 @@ class FlareSolverrClient:
         status = result.get("status")
         if status != "ok":
             msg = result.get("message", "Unknown error")
-            if retry and "session" in msg.lower():
+            if retry and failed_id and "session" in msg.lower():
                 logger.warning("Session error from FlareSolverr; replacing session")
                 self._replace_session(failed_id)
                 return self._do_get_with_cookies(url, retry=False)
-            raise FlareSolverrError(f"FlareSolverr returned status={status!r}: {msg}")
+            raise FlareSolverrError(f"Solver returned status={status!r}: {msg}")
 
         solution = result.get("solution", {})
         http_status = solution.get("status", 200)
@@ -296,33 +381,39 @@ class FlareSolverrClient:
 
     def post_form(self, url: str, post_data: str) -> dict:
         """
-        POST form-encoded *post_data* to *url* through FlareSolverr.
+        POST form-encoded *post_data* to *url* through the browser.
 
         Routes the request through the persistent browser session so it
         carries the same IP and cookies that solved the Cloudflare challenge.
         Automatically recreates the session on failure (same retry logic as
         GET requests).
 
+        Raises :class:`FlareSolverrError` on a backend without
+        ``request.post`` (Byparr); callers should refresh cookies with
+        :meth:`get_page_with_cookies` and POST directly instead.
+
         Returns the parsed JSON body of the response.
         """
+        if not self.supports_post:
+            raise FlareSolverrError(
+                f"{self.backend} backend does not support request.post"
+            )
         with self._using_session(), self._cmd_lock:
             return self._do_post_form(url, post_data)
 
     def _do_post_form(self, url: str, post_data: str, retry: bool = True) -> dict:
-        payload = {
-            "cmd": "request.post",
-            "url": url,
-            "postData": post_data,
-            "maxTimeout": self._timeout_ms,
-            "session": self._session_id,
-        }
-        failed_id = payload["session"]
+        payload = self._get_payload("request.post", url)
+        payload.pop("tabs_till_verify", None)
+        payload["postData"] = post_data
+        failed_id = payload.get("session")
         try:
             result = self._post(payload)
         except FlareSolverrError:
             if retry:
                 logger.warning("FlareSolverr POST error; replacing session and retrying")
-                payload["session"] = self._replace_session(failed_id)
+                replacement = self._replace_session(failed_id)
+                if replacement:
+                    payload["session"] = replacement
                 result = self._post(payload)
             else:
                 raise
@@ -330,7 +421,7 @@ class FlareSolverrClient:
         status = result.get("status")
         if status != "ok":
             msg = result.get("message", "Unknown error")
-            if retry and "session" in msg.lower():
+            if retry and failed_id and "session" in msg.lower():
                 logger.warning("Session error on POST; replacing session")
                 self._replace_session(failed_id)
                 return self._do_post_form(url, post_data, retry=False)
