@@ -363,7 +363,7 @@ class SiteClient:
         try:
             resp = self._session.post(url, data=data, headers=headers, timeout=self._timeout)
         except requests.RequestException as exc:
-            logger.debug("[%s] direct POST failed: %s", self.host, exc)
+            logger.info("[%s] direct POST failed: %s: %s", self.host, type(exc).__name__, exc)
             self._note_direct_failure()
             return None
 
@@ -372,6 +372,10 @@ class SiteClient:
             self._note_direct_failure()
             return None
         if resp.status_code >= 400:
+            logger.info(
+                "[%s] direct POST HTTP %s: %s", self.host, resp.status_code,
+                resp.text[:160].replace("\n", " "),
+            )
             self._note_direct_failure()
             return None
 
@@ -382,7 +386,7 @@ class SiteClient:
         try:
             return json.loads(body)
         except ValueError:
-            logger.debug("[%s] non-JSON POST response: %s", self.host, body[:160])
+            logger.info("[%s] non-JSON POST response (HTTP %s): %s", self.host, resp.status_code, body[:160].replace("\n", " "))
             return None
 
 
