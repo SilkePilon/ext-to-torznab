@@ -62,6 +62,12 @@ _BROWSER_ERROR_MARKERS = ("main-frame-error", "interstitial-wrapper", "chrome-er
 # quota runs out).  Cloudflare's cf_clearance is deliberately not in here.
 _SITE_SESSION_COOKIES = ("PHPSESSID",)
 
+# After a solver round-trip the direct POST is retried once.  If it is
+# challenged again this soon after a solve, the cookies are simply not being
+# honoured (wrong egress IP, UA mismatch) and solving again would only burn
+# another browser launch per magnet lookup.
+_RESOLVE_BACKOFF = 60.0
+
 _RE_PRE = re.compile(r"<pre[^>]*>(.*?)</pre>", re.DOTALL)
 
 
@@ -126,6 +132,11 @@ class SiteClient:
         # calls per session before answering "Too many requests").
         self._api_calls = 0
 
+        # Single-flight for cookie refreshes on a solver without request.post:
+        # concurrent magnet workers that all hit a 403 must share one solve.
+        self._solve_lock = threading.Lock()
+        self._last_solve_at = 0.0
+
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
@@ -179,11 +190,14 @@ class SiteClient:
         page." until a new session is started.  Cloudflare cookies are kept so
         this never costs another challenge solve.
         """
-        for name in _SITE_SESSION_COOKIES:
-            try:
-                self._session.cookies.clear(domain=self.host, path="/", name=name)
-            except KeyError:
-                pass
+        # Match by name only: the solver hands cookies back scoped to the
+        # domain that set them (extto.com, .extto.com), not to self.host.
+        for c in list(self._session.cookies):
+            if c.name in _SITE_SESSION_COOKIES:
+                try:
+                    self._session.cookies.clear(domain=c.domain, path=c.path, name=c.name)
+                except KeyError:
+                    pass
         self.invalidate_tokens()
         with self._token_lock:
             self._api_calls = 0
@@ -218,7 +232,7 @@ class SiteClient:
         try:
             resp = self._session.get(url, timeout=self._timeout, allow_redirects=True)
         except requests.RequestException as exc:
-            logger.debug("[%s] direct GET failed: %s", self.host, exc)
+            logger.info("[%s] direct GET failed: %s", self.host, exc)
             self._note_direct_failure()
             return None
 
@@ -227,7 +241,7 @@ class SiteClient:
             self._note_direct_failure()
             return None
         if resp.status_code >= 400:
-            logger.debug("[%s] direct GET HTTP %s", self.host, resp.status_code)
+            logger.info("[%s] direct GET HTTP %s", self.host, resp.status_code)
             self._note_direct_failure()
             return None
         return resp.text
@@ -252,16 +266,29 @@ class SiteClient:
             self._direct_blocked_until = time.time() + 300
             logger.info("[%s] using FlareSolverr for the next 5 min", self.host)
 
-    def _import_browser_state(self, cookies: dict, user_agent: str) -> None:
+    def _import_browser_state(self, cookies, user_agent: str) -> None:
         """Copy the solved Cloudflare cookies + UA into the direct session.
 
         ``cf_clearance`` is bound to the User Agent that solved the challenge,
         so both must be adopted together for direct requests to be accepted.
+
+        *cookies* is a list of ``{"name", "value", "domain", "path"}`` dicts
+        (a plain ``{name: value}`` dict is accepted for older callers).  The
+        cookie's own domain is kept: ``search.extto.com`` redirects to
+        ``extto.com``, and a ``cf_clearance`` pinned to ``search.extto.com``
+        never reaches the host that actually checks it.
         """
         if user_agent:
             self._session.headers["User-Agent"] = user_agent
-        for name, value in (cookies or {}).items():
-            self._session.cookies.set(name, value, domain=self.host)
+        if isinstance(cookies, dict):
+            cookies = [{"name": n, "value": v} for n, v in cookies.items()]
+        for c in cookies or []:
+            self._session.cookies.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain") or self.host,
+                path=c.get("path") or "/",
+            )
         if cookies:
             # Give the fast path another go now that we hold clearance cookies.
             self._direct_blocked_until = 0.0
@@ -291,8 +318,8 @@ class SiteClient:
             # that imports fresh clearance cookies + UA and re-opens the
             # direct transport, then the POST is retried directly.  The
             # solved cookies are valid for our own requests because both
-            # egress from the same IP (see flaresolverr.yaml in the homelab).
-            self._flaresolverr_get(self.url("/browse/"))
+            # egress from the same IP (see byparr.yaml in the homelab).
+            self._refresh_clearance(noticed_at=time.time())
             result = self._direct_post(url, data, csrf)
             if result is not None:
                 return result
@@ -302,6 +329,26 @@ class SiteClient:
             return self._fs.post_form(url, urlencode(data))
         except FlareSolverrError as exc:
             raise SiteUnavailable(f"{self.host}: {exc}") from exc
+
+    def _refresh_clearance(self, noticed_at: float) -> None:
+        """Solve one page to refresh clearance cookies – at most once per burst.
+
+        *noticed_at* is when the caller saw its direct request fail.  A solve
+        that finished after that already covers the caller, so it just
+        retries.  A solve that finished shortly *before* it evidently did not
+        help, so the caller gives up instead of launching another browser.
+        """
+        with self._solve_lock:
+            if self._last_solve_at >= noticed_at:
+                return
+            since = noticed_at - self._last_solve_at
+            if since < _RESOLVE_BACKOFF:
+                raise SiteUnavailable(
+                    f"{self.host}: still challenged {since:.0f}s after a fresh solve; "
+                    "solved cookies are not being honoured"
+                )
+            self._flaresolverr_get(self.url("/browse/"))
+            self._last_solve_at = time.time()
 
     def _direct_post(self, url: str, data: Dict[str, str], csrf: str) -> Optional[dict]:
         headers = {

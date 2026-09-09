@@ -328,7 +328,12 @@ class FlareSolverrClient:
         """
         Fetch *url* through the solver.
 
-        Returns (html, cookies_dict, user_agent).
+        Returns ``(html, cookies, user_agent)`` where *cookies* is a list of
+        ``{"name", "value", "domain", "path"}`` dicts.  Domains are kept
+        because the solver may have been redirected (``search.extto.com`` →
+        ``extto.com``) and Cloudflare scopes ``cf_clearance`` to the host it
+        was issued for; re-homing it onto the requested host silently loses
+        it on the very next redirect.
         Automatically creates/recreates the browser session as needed.
         """
         with self._using_session(), self._cmd_lock:
@@ -369,13 +374,16 @@ class FlareSolverrClient:
         html = solution.get("response", "")
         user_agent = solution.get("userAgent", "")
 
-        # Convert cookie list to a plain dict for requests.Session
-        cookies: dict = {}
-        for c in solution.get("cookies", []):
-            name = c.get("name", "")
-            value = c.get("value", "")
-            if name:
-                cookies[name] = value
+        cookies = [
+            {
+                "name": c.get("name", ""),
+                "value": c.get("value", ""),
+                "domain": c.get("domain") or "",
+                "path": c.get("path") or "/",
+            }
+            for c in solution.get("cookies", [])
+            if c.get("name")
+        ]
 
         return html, cookies, user_agent
 

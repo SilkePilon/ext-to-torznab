@@ -120,7 +120,9 @@ class ByparrGetTest(unittest.TestCase):
         ])
         html, cookies, ua = client.get_page_with_cookies("https://ext.to/browse/")
         self.assertEqual(html, "<html>ok</html>")
-        self.assertEqual(cookies, {"cf_clearance": "abc"})
+        self.assertEqual(
+            cookies, [{"name": "cf_clearance", "value": "abc", "domain": "", "path": "/"}]
+        )
         self.assertEqual(ua, "UA")
         self.assertEqual([p["cmd"] for p in fake.posted], ["request.get"])
         self.assertNotIn("session", fake.posted[0])
@@ -192,7 +194,11 @@ class _FakeSolver:
         self.fetched.append(url)
         if self.fail:
             raise FlareSolverrError("solver down")
-        return "<html>solved</html>", {"cf_clearance": "fresh"}, "SolverUA"
+        return (
+            "<html>solved</html>",
+            [{"name": "cf_clearance", "value": "fresh", "domain": ".ext.to", "path": "/"}],
+            "SolverUA",
+        )
 
     def post_form(self, url, data):
         raise AssertionError("post_form must not be used")
@@ -223,7 +229,9 @@ class SiteClientPostWithoutBrowserPostTest(unittest.TestCase):
         self.assertEqual(solver.fetched, ["https://ext.to/browse/"])
         self.assertEqual(client._session.post.call_count, 2)
         self.assertEqual(client._session.headers["User-Agent"], "SolverUA")
-        client._session.cookies.set.assert_called_with("cf_clearance", "fresh", domain="ext.to")
+        client._session.cookies.set.assert_called_with(
+            "cf_clearance", "fresh", domain=".ext.to", path="/"
+        )
         self.assertEqual(client.transport, "direct")
 
     def test_second_direct_failure_after_resolve_is_unavailable(self):
@@ -291,6 +299,130 @@ class SiteClientPostWithoutBrowserPostTest(unittest.TestCase):
         self.assertEqual(result["via"], "browser")
         self.assertEqual(solver.fetched, [])
         self.assertEqual(len(solver.posted), 1)
+
+
+class ClearanceRefreshSingleFlightTest(unittest.TestCase):
+    def _client(self, solver, posts):
+        client = SiteClient("https://ext.to", flaresolverr=solver, prefer_direct=True)
+        client._session = mock.Mock()
+        client._session.headers = {}
+        client._session.cookies = mock.Mock()
+        client._session.post.side_effect = posts
+        return client
+
+    def test_solve_finished_after_failure_is_reused(self):
+        import time as _time
+
+        solver = _FakeSolver()
+        client = self._client(solver, [
+            _http_response(403, "Just a moment"),
+            _http_response(200, '{"success": true}'),
+        ])
+        # Another worker solved a moment after this one will notice its 403.
+        client._last_solve_at = _time.time() + 5
+        result = client.post_json("/ajax/x.php", {"a": "1"})
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(solver.fetched, [])
+
+    def test_recent_unhelpful_solve_short_circuits(self):
+        import time as _time
+
+        solver = _FakeSolver()
+        client = self._client(solver, [_http_response(403, "Just a moment")])
+        client._last_solve_at = _time.time() - 10
+        with self.assertRaises(SiteUnavailable) as ctx:
+            client.post_json("/ajax/x.php", {"a": "1"})
+        self.assertIn("not being honoured", str(ctx.exception))
+        self.assertEqual(solver.fetched, [])
+        self.assertEqual(client._session.post.call_count, 1)
+
+    def test_old_solve_is_refreshed(self):
+        import time as _time
+
+        solver = _FakeSolver()
+        client = self._client(solver, [
+            _http_response(403, "Just a moment"),
+            _http_response(200, '{"success": true}'),
+        ])
+        client._last_solve_at = _time.time() - 600
+        client.post_json("/ajax/x.php", {"a": "1"})
+        self.assertEqual(solver.fetched, ["https://ext.to/browse/"])
+        self.assertGreater(client._last_solve_at, _time.time() - 5)
+
+    def test_concurrent_workers_share_one_solve(self):
+        import threading
+        import time as _time
+
+        class SlowSolver(_FakeSolver):
+            def get_page_with_cookies(self, url):
+                _time.sleep(0.2)
+                return super().get_page_with_cookies(url)
+
+        solver = SlowSolver()
+        client = SiteClient("https://ext.to", flaresolverr=solver, prefer_direct=True)
+        client._session = mock.Mock()
+        client._session.headers = {}
+        client._session.cookies = mock.Mock()
+        # Every first attempt is challenged, every retry succeeds.
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def post(url, data=None, headers=None, timeout=None):
+            with lock:
+                calls["n"] += 1
+            return (
+                _http_response(200, '{"success": true}')
+                if client._last_solve_at
+                else _http_response(403, "Just a moment")
+            )
+
+        client._session.post.side_effect = post
+        results = []
+        threads = [
+            threading.Thread(target=lambda: results.append(client.post_json("/ajax/x.php", {"a": "1"})))
+            for _ in range(5)
+        ]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(len(results), 5)
+        self.assertEqual(len(solver.fetched), 1, "workers must share a single solve")
+
+
+class CookieDomainTest(unittest.TestCase):
+    def test_cookie_domains_are_preserved(self):
+        client = SiteClient("https://search.extto.com", flaresolverr=None)
+        client._import_browser_state(
+            [
+                {"name": "cf_clearance", "value": "v", "domain": ".extto.com", "path": "/"},
+                {"name": "PHPSESSID", "value": "p", "domain": "extto.com", "path": "/"},
+                {"name": "bare", "value": "b", "domain": "", "path": ""},
+            ],
+            "UA",
+        )
+        jar = {(c.name, c.domain, c.path) for c in client._session.cookies}
+        self.assertIn(("cf_clearance", ".extto.com", "/"), jar)
+        self.assertIn(("PHPSESSID", "extto.com", "/"), jar)
+        self.assertIn(("bare", "search.extto.com", "/"), jar)
+        self.assertEqual(client._session.headers["User-Agent"], "UA")
+
+    def test_legacy_dict_cookies_land_on_host(self):
+        client = SiteClient("https://search.extto.com", flaresolverr=None)
+        client._import_browser_state({"cf_clearance": "v"}, "")
+        jar = {(c.name, c.domain) for c in client._session.cookies}
+        self.assertIn(("cf_clearance", "search.extto.com"), jar)
+
+    def test_rotate_site_session_clears_by_name_across_domains(self):
+        client = SiteClient("https://search.extto.com", flaresolverr=None)
+        client._import_browser_state(
+            [
+                {"name": "cf_clearance", "value": "v", "domain": ".extto.com", "path": "/"},
+                {"name": "PHPSESSID", "value": "p", "domain": "extto.com", "path": "/"},
+            ],
+            "UA",
+        )
+        client.rotate_site_session()
+        names = {c.name for c in client._session.cookies}
+        self.assertEqual(names, {"cf_clearance"})
 
 
 if __name__ == "__main__":
