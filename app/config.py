@@ -104,8 +104,27 @@ class Config:
     # Seconds a resolved magnet link stays cached
     MAGNET_CACHE_TTL: int = _env_int("MAGNET_CACHE_TTL", 3600)
 
-    # Seconds a fetched search page stays cached (0 disables page caching)
-    PAGE_CACHE_TTL: int = _env_int("PAGE_CACHE_TTL", 120)
+    # Seconds a fetched search page is served from cache without asking the
+    # site again (0 disables page caching)
+    PAGE_CACHE_TTL: int = _env_int("PAGE_CACHE_TTL", 300)
+
+    # Seconds a cached page may still be served once it is no longer fresh –
+    # only when the site fails or is slower than SEARCH_DEADLINE.  Old
+    # results beat an empty answer or an *arr timeout.
+    PAGE_CACHE_STALE: int = _env_int("PAGE_CACHE_STALE", 86400)
+
+    # Most seconds a search waits on the site.  Past it the answer comes from
+    # the cache (stale if need be, empty if nothing is cached) while the
+    # fetch finishes in the background, so the next try is a cache hit.
+    # Sonarr/Radarr/Prowlarr give up after 100 s and back the indexer off
+    # after a timeout; an empty answer costs them nothing.  0 waits forever.
+    SEARCH_DEADLINE: float = _env_float("SEARCH_DEADLINE", 25.0)
+
+    # Seconds between background refreshes of the keyword-less feeds *arr
+    # apps poll (RSS sync, connection test).  This also notices an expired
+    # Cloudflare clearance and re-solves it before a real search needs it.
+    # 0 disables.
+    KEEPALIVE_INTERVAL: int = _env_int("KEEPALIVE_INTERVAL", 600)
 
     # Whether to include adult (XXX) content in results
     INCLUDE_ADULT: bool = _env_bool("INCLUDE_ADULT", True)

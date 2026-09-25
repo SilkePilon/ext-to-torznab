@@ -42,7 +42,8 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlsplit
@@ -255,6 +256,51 @@ class _TTLCache:
             self._data[key] = (time.time() + self._ttl, value)
 
 
+class _PageCache:
+    """Parsed search pages, kept past freshness so they can be served stale.
+
+    An entry younger than *fresh* answers without touching the site.  An
+    older one (up to *stale*) is still handed out when the site is down or
+    too slow to answer before the *arr timeout – old results beat none.
+    """
+
+    def __init__(self, fresh: int, stale: int, max_entries: int = 256) -> None:
+        self.fresh = max(0, fresh)
+        self.stale = max(self.fresh, stale)
+        self._max = max_entries
+        self._data: "OrderedDict[object, Tuple[float, object]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key, max_age: float):
+        """Return ``(age, value)`` for an entry at most *max_age* old, else ``None``."""
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return None
+            age = time.time() - entry[0]
+            if age > self.stale:
+                self._data.pop(key, None)
+                return None
+            if age > max_age:
+                return None
+            self._data.move_to_end(key)
+            return age, entry[1]
+
+    def set(self, key, value) -> None:
+        if self.stale <= 0:
+            return
+        with self._lock:
+            self._data[key] = (time.time(), value)
+            self._data.move_to_end(key)
+            while len(self._data) > self._max:
+                self._data.popitem(last=False)
+
+    def age(self, key) -> Optional[float]:
+        with self._lock:
+            entry = self._data.get(key)
+            return time.time() - entry[0] if entry else None
+
+
 # ---------------------------------------------------------------------------
 # Main scraper
 # ---------------------------------------------------------------------------
@@ -273,6 +319,7 @@ class ExtToScraper:
         page_cache_ttl: int = 120,
         magnet_max_resolve: int = 30,
         magnet_time_budget: float = 5.0,
+        page_cache_stale: int = 0,
     ) -> None:
         self._pool = pool
         self._include_adult = include_adult
@@ -280,7 +327,16 @@ class ExtToScraper:
         self._magnet_workers = max(1, magnet_workers)
         self._magnet_workers_fs = max(1, magnet_workers_flaresolverr)
         self._magnet_cache = _TTLCache(magnet_cache_ttl)
-        self._page_cache = _TTLCache(page_cache_ttl, max_entries=64)
+        self._page_cache = _PageCache(page_cache_ttl, page_cache_stale)
+        # Single-flight for page fetches: identical searches arriving while
+        # one is on the wire (Sonarr + Radarr, or a retry after a timeout)
+        # wait for it instead of fetching – and maybe solving – again.
+        self._inflight: Dict[object, Future] = {}
+        self._inflight_lock = threading.Lock()
+        # Keyword-less pages (RSS sync, connection tests) and when they were
+        # last asked for; the background keeper keeps these warm.
+        self._feeds: Dict[object, Tuple[str, Dict[str, str], float]] = {}
+        self._feeds_lock = threading.Lock()
         self._refresh_locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._max_resolve = max(0, magnet_max_resolve)
@@ -304,7 +360,15 @@ class ExtToScraper:
         episode: Optional[int] = None,
         offset: int = 0,
         limit: int = 25,
+        cached_only: bool = False,
     ) -> List[Dict]:
+        """Search the site.
+
+        With *cached_only* nothing goes over the network: pages come from the
+        cache, however stale, and magnets are only filled in from the magnet
+        cache.  That is the answer given when a live search overruns its
+        deadline.
+        """
         effective_query = query.strip()
         if effective_query and season is not None:
             if episode is not None:
@@ -320,6 +384,18 @@ class ExtToScraper:
 
         for page in range(start_page, start_page + pages_needed):
             params = self._build_params(effective_query, page, imdbid, categories)
+            if cached_only:
+                hit = self._cached_results("/browse/", params, max_age=self._page_cache.stale)
+                if hit is None:
+                    break
+                page_results, client = hit
+                all_results.extend(page_results)
+                if len(page_results) < _RESULTS_PER_PAGE:
+                    break
+                continue
+            if not effective_query and not imdbid:
+                with self._feeds_lock:
+                    self._feeds[self._page_key("/browse/", params)] = ("/browse/", params, time.time())
             try:
                 page_results, client = self._fetch_results("/browse/", params)
             except SiteUnavailable as exc:
@@ -350,7 +426,12 @@ class ExtToScraper:
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         results = all_results[local_offset: local_offset + limit]
 
-        if client is not None and self._should_resolve(client):
+        if cached_only:
+            for item in results:
+                cached = self._magnet_cache.get(item.get("torrent_id"))
+                if cached:
+                    self._apply_magnet(item, cached)
+        elif client is not None and self._should_resolve(client):
             self._enrich_with_magnets(results, client)
 
         return results
@@ -386,26 +467,121 @@ class ExtToScraper:
             params["page"] = str(page)
         return params
 
-    def _fetch_results(self, path: str, params: Dict[str, str]) -> Tuple[List[Dict], SiteClient]:
+    @staticmethod
+    def _page_key(path: str, params: Dict[str, str]) -> Tuple:
+        return (path, tuple(sorted(params.items())))
+
+    def _cached_results(
+        self, path: str, params: Dict[str, str], max_age: float
+    ) -> Optional[Tuple[List[Dict], SiteClient]]:
+        hit = self._page_cache.get(self._page_key(path, params), max_age)
+        if hit is None:
+            return None
+        age, (results, client) = hit
+        logger.debug("Page cache hit (%.0fs old): %s %s", age, path, params)
+        # Copies, so magnet enrichment on one response never leaks into the next.
+        return [dict(r) for r in results], client
+
+    def _fetch_results(
+        self, path: str, params: Dict[str, str], force: bool = False
+    ) -> Tuple[List[Dict], SiteClient]:
         """Fetch and parse one search page, caching the *parsed* rows.
 
         Caching rows instead of the raw page keeps a cache entry at a few KB
         rather than the ~1 MB of HTML the site serves, and a cache hit skips
-        the parse as well as the fetch.  Callers get copies, so magnet
-        enrichment on one response never leaks into the next.
+        the parse as well as the fetch.  *force* skips the freshness check
+        (background refresh).  When every mirror fails, a stale copy is
+        returned rather than nothing.
         """
-        key = (path, tuple(sorted(params.items())))
-        cached = self._page_cache.get(key)
-        if cached is not None:
-            results, client = cached
-            logger.debug("Page cache hit: %s %s", path, params)
-            return [dict(r) for r in results], client
+        key = self._page_key(path, params)
+        if not force:
+            hit = self._cached_results(path, params, max_age=self._page_cache.fresh)
+            if hit is not None:
+                return hit
 
-        logger.info("Fetching %s", self._pool.active.url(path, params))
-        html, client = self._pool.get(path, params)
-        results = self._parse_html(html, client)
-        self._page_cache.set(key, (results, client))
+        with self._inflight_lock:
+            future = self._inflight.get(key)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight[key] = future
+
+        if owner:
+            try:
+                logger.info("Fetching %s", self._pool.active.url(path, params))
+                html, client = self._pool.get(path, params)
+                results = self._parse_html(html, client)
+                self._page_cache.set(key, (results, client))
+                future.set_result((results, client))
+            except BaseException as exc:
+                future.set_exception(exc)
+            finally:
+                with self._inflight_lock:
+                    self._inflight.pop(key, None)
+        else:
+            logger.debug("Joining in-flight fetch: %s %s", path, params)
+
+        try:
+            results, client = future.result()
+        except SiteUnavailable:
+            stale = self._cached_results(path, params, max_age=self._page_cache.stale)
+            if stale is None:
+                raise
+            logger.warning(
+                "Site unavailable; serving cached page (%.0fs old) for %s",
+                self._page_cache.age(key) or 0, params,
+            )
+            return stale
         return [dict(r) for r in results], client
+
+    # -----------------------------------------------------------------------
+    # Background upkeep
+    # -----------------------------------------------------------------------
+
+    def warm_up(self) -> SiteClient:
+        """Fetch the default feed: picks a mirror, solves if needed, fills the cache.
+
+        It is the page a keyword-less TV request (Sonarr's connection test)
+        asks for, so that test is answered from the cache afterwards.
+        """
+        _results, client = self._fetch_results("/browse/", self._default_feed_params(), force=True)
+        return client
+
+    def _default_feed_params(self) -> Dict[str, str]:
+        return self._build_params("", 1, None, [5000])
+
+    def refresh_feeds(self, max_age: float, keep_for: float = 86400.0, limit: int = 8) -> int:
+        """Re-fetch keyword-less pages asked for recently whose copy is *max_age* old.
+
+        This is what *arr RSS syncs and connection tests ask for, over and
+        over; refreshing them in the background keeps those answers instant
+        and, as a side effect, keeps the Cloudflare clearance warm – an
+        expired one gets re-solved here instead of inside a live request.
+        With no feed known yet, the default TV feed stands in.  Returns the
+        number of pages fetched.
+        """
+        now = time.time()
+        with self._feeds_lock:
+            for key, (_p, _params, last) in list(self._feeds.items()):
+                if now - last > keep_for:
+                    self._feeds.pop(key, None)
+            feeds = sorted(self._feeds.items(), key=lambda kv: kv[1][2], reverse=True)[:limit]
+        if not feeds:
+            params = self._default_feed_params()
+            feeds = [(self._page_key("/browse/", params), ("/browse/", params, now))]
+
+        fetched = 0
+        for key, (path, params, _last) in feeds:
+            age = self._page_cache.age(key)
+            if age is not None and age < max_age:
+                continue
+            try:
+                self._fetch_results(path, params, force=True)
+                fetched += 1
+            except SiteUnavailable as exc:
+                logger.warning("Background refresh failed for %s: %s", params, exc)
+                break
+        return fetched
 
     # -----------------------------------------------------------------------
     # Parsing

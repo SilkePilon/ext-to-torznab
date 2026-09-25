@@ -16,6 +16,8 @@ services:
     container_name: flaresolverr
     environment:
       - LOG_LEVEL=info
+      # Solving ext.to's checkbox challenge on slow hardware: avoids re-solve loops
+      # - BROWSER_WAIT_TIMEOUT=3
       # Uncomment if you need to adjust the browser start URL for your region:
       # - TEST_URL=https://www.google.com
     ports:
@@ -74,6 +76,15 @@ services:
       # Longest a search waits for magnet resolution before answering with the
       # rows it has (the rest resolve on grab, or in the background)
       - MAGNET_TIME_BUDGET=5
+
+      # Longest a search waits on the site.  Past it the answer comes from
+      # the cache (stale if need be) and the fetch finishes in the background,
+      # so *arr apps never hit their 100 s timeout and back the indexer off.
+      - SEARCH_DEADLINE=25
+
+      # Refresh the feeds *arr apps poll (RSS sync, connection test) and the
+      # Cloudflare clearance in the background every this many seconds
+      - KEEPALIVE_INTERVAL=600
 
       # Logging verbosity  (DEBUG / INFO / WARNING / ERROR)
       - LOG_LEVEL=INFO

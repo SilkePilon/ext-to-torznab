@@ -80,8 +80,11 @@ def _looks_like_browser_error(body: str) -> bool:
     return any(marker in head for marker in _BROWSER_ERROR_MARKERS)
 
 
-def _looks_like_challenge(status: int, body: str) -> bool:
+def _looks_like_challenge(status: int, body: str, headers=None) -> bool:
     if status in (403, 503) or status in _CF_ORIGIN_ERRORS:
+        return True
+    # Cloudflare labels every interstitial it serves, whatever the status.
+    if headers is not None and headers.get("cf-mitigated"):
         return True
     head = body[:4000]
     return any(marker in head for marker in _CHALLENGE_MARKERS)
@@ -134,8 +137,16 @@ class SiteClient:
 
         # Single-flight for cookie refreshes on a solver without request.post:
         # concurrent magnet workers that all hit a 403 must share one solve.
+        # Also shared by page fetches, so a burst of requests that all find
+        # the clearance expired waits for one browser solve, not one each.
         self._solve_lock = threading.Lock()
         self._last_solve_at = 0.0
+
+        # When the current cf_clearance arrived, and when a direct request
+        # last got through.  Diagnostics only: tells how long a clearance
+        # actually lasts on this host.
+        self._clearance_at = 0.0
+        self._direct_ok_at = 0.0
 
     # ------------------------------------------------------------------
     # Introspection
@@ -147,6 +158,13 @@ class SiteClient:
         if self._prefer_direct and time.time() >= self._direct_blocked_until:
             return "direct"
         return "flaresolverr"
+
+    def clearance_status(self) -> Dict[str, Optional[int]]:
+        now = time.time()
+        return {
+            "clearance_age_s": int(now - self._clearance_at) if self._clearance_at else None,
+            "last_direct_ok_s": int(now - self._direct_ok_at) if self._direct_ok_at else None,
+        }
 
     def url(self, path: str, params: Optional[Dict[str, str]] = None) -> str:
         full = path if path.startswith("http") else urljoin(self.base + "/", path.lstrip("/"))
@@ -217,16 +235,40 @@ class SiteClient:
         """Fetch a page and return its HTML, escalating to FlareSolverr if needed."""
         url = self.url(path, params)
 
+        noticed_at = time.time()
         if self.transport == "direct":
-            html = self._direct_get(url)
+            html = self._try_direct(url)
             if html is not None:
-                self._direct_failures = 0
-                self.remember_tokens(html)
                 return html
 
-        html = self._flaresolverr_get(url)
+        html = self._solve_get(url, noticed_at)
         self.remember_tokens(html)
         return html
+
+    def _try_direct(self, url: str) -> Optional[str]:
+        html = self._direct_get(url)
+        if html is not None:
+            self._direct_failures = 0
+            self._direct_ok_at = time.time()
+            self.remember_tokens(html)
+        return html
+
+    def _solve_get(self, url: str, noticed_at: float) -> str:
+        """Fetch *url* through the solver – unless a solve already covers us.
+
+        A solve takes seconds to a minute, and every request that arrives in
+        the meantime is challenged as well.  They queue here; when one gets
+        the lock after somebody else's solve finished, the fresh cookies are
+        tried directly first, so a burst of N requests costs one browser run.
+        """
+        with self._solve_lock:
+            if self._last_solve_at >= noticed_at and self.transport == "direct":
+                html = self._try_direct(url)
+                if html is not None:
+                    return html
+            html = self._flaresolverr_get(url)
+            self._last_solve_at = time.time()
+            return html
 
     def _direct_get(self, url: str) -> Optional[str]:
         try:
@@ -236,8 +278,14 @@ class SiteClient:
             self._note_direct_failure()
             return None
 
-        if _looks_like_challenge(resp.status_code, resp.text):
-            logger.info("[%s] direct GET challenged (HTTP %s)", self.host, resp.status_code)
+        if _looks_like_challenge(resp.status_code, resp.text, resp.headers):
+            if self._clearance_at and self._direct_ok_at > self._clearance_at:
+                logger.info(
+                    "[%s] direct GET challenged (HTTP %s); cf_clearance worked for %.0f min",
+                    self.host, resp.status_code, (self._direct_ok_at - self._clearance_at) / 60,
+                )
+            else:
+                logger.info("[%s] direct GET challenged (HTTP %s)", self.host, resp.status_code)
             self._note_direct_failure()
             return None
         if resp.status_code >= 400:
@@ -289,6 +337,8 @@ class SiteClient:
                 domain=c.get("domain") or self.host,
                 path=c.get("path") or "/",
             )
+        if any(c["name"] == "cf_clearance" for c in cookies or []):
+            self._clearance_at = time.time()
         if cookies:
             # Give the fast path another go now that we hold clearance cookies.
             self._direct_blocked_until = 0.0
@@ -367,7 +417,7 @@ class SiteClient:
             self._note_direct_failure()
             return None
 
-        if _looks_like_challenge(resp.status_code, resp.text):
+        if _looks_like_challenge(resp.status_code, resp.text, resp.headers):
             logger.info("[%s] direct POST challenged (HTTP %s)", self.host, resp.status_code)
             self._note_direct_failure()
             return None
@@ -467,6 +517,7 @@ class SitePool:
                 "active": c is self._active,
                 "transport": c.transport,
                 "cooldown_s": max(0, int(self._down_until.get(c.base, 0) - now)),
+                **c.clearance_status(),
             }
             for c in self.clients
         ]

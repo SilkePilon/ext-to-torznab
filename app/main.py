@@ -16,7 +16,8 @@ Supported functions (t= parameter):
 import hmac
 import logging
 import threading
-import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 _fs_client: Optional[FlareSolverrClient] = None
 _pool: Optional[SitePool] = None
 _scraper: Optional[ExtToScraper] = None
+# Live searches run here so a request can stop waiting at SEARCH_DEADLINE
+# while the fetch carries on and fills the cache.
+_search_pool: Optional[ThreadPoolExecutor] = None
+_stop = threading.Event()
 
 _XML_CT = "application/rss+xml; charset=UTF-8"
 _SEARCH_FUNCTIONS = {"search", "tvsearch", "movie", "music", "book"}
@@ -58,7 +63,7 @@ _SEARCH_FUNCTIONS = {"search", "tvsearch", "movie", "music", "book"}
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    global _fs_client, _pool, _scraper
+    global _fs_client, _pool, _scraper, _search_pool
 
     logger.info("═══════════════════════════════════════")
     logger.info("  EXT Torrents Torznab Proxy starting  ")
@@ -67,6 +72,8 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     logger.info("  Direct first : %s", config.PREFER_DIRECT)
     logger.info("  Magnets      : %s (%d workers, %.1fs budget)",
                 config.RESOLVE_MAGNETS, config.MAGNET_WORKERS, config.MAGNET_TIME_BUDGET)
+    logger.info("  Deadline     : %.0fs (stale cache up to %ds)", config.SEARCH_DEADLINE, config.PAGE_CACHE_STALE)
+    logger.info("  Keep-alive   : %s", f"every {config.KEEPALIVE_INTERVAL}s" if config.KEEPALIVE_INTERVAL > 0 else "off")
     logger.info("  Include adult: %s", config.INCLUDE_ADULT)
     logger.info("  API key set  : %s", bool(config.API_KEY))
     logger.info("═══════════════════════════════════════")
@@ -98,16 +105,22 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         magnet_workers_flaresolverr=config.MAGNET_WORKERS_FLARESOLVERR,
         magnet_cache_ttl=config.MAGNET_CACHE_TTL,
         page_cache_ttl=config.PAGE_CACHE_TTL,
+        page_cache_stale=config.PAGE_CACHE_STALE,
         magnet_max_resolve=config.MAGNET_MAX_RESOLVE,
         magnet_time_budget=config.MAGNET_TIME_BUDGET,
     )
 
     # Pick a working mirror and warm its cookie jar + page tokens in the
-    # background, so the first real search doesn't pay for it.
-    threading.Thread(target=_warm_up, name="warmup", daemon=True).start()
+    # background, so the first real search doesn't pay for it; then keep
+    # the polled feeds and the clearance warm.
+    _search_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="search")
+    _stop.clear()
+    threading.Thread(target=_background, name="keeper", daemon=True).start()
 
     yield
 
+    _stop.set()
+    _search_pool.shutdown(wait=False, cancel_futures=True)
     if _fs_client:
         _fs_client.close()
     logger.info("EXT Torrents Torznab Proxy stopped")
@@ -122,12 +135,13 @@ def _warm_up(attempts: int = 3, delay: float = 20.0) -> None:
     """
     for attempt in range(1, attempts + 1):
         try:
-            _html, client = _pool.get("/browse/", {"cat": "2", "sort": "age", "order": "desc"})
+            client = _scraper.warm_up()
         except SiteUnavailable as exc:
             _pool.clear_cooldowns()
             if attempt < attempts:
                 logger.warning("Warm-up attempt %d failed (%s); retrying in %.0fs", attempt, exc, delay)
-                time.sleep(delay)
+                if _stop.wait(delay):
+                    return
                 continue
             logger.warning("Warm-up failed, will retry on first request: %s", exc)
             return
@@ -139,13 +153,42 @@ def _warm_up(attempts: int = 3, delay: float = 20.0) -> None:
         return
 
 
+def _background() -> None:
+    _warm_up()
+    interval = config.KEEPALIVE_INTERVAL
+    if interval <= 0:
+        return
+    while not _stop.wait(interval):
+        try:
+            # A little under the interval, so a feed fetched by a live
+            # request just before the tick is left alone, not one missed.
+            _scraper.refresh_feeds(max_age=interval * 0.8)
+        except Exception as exc:  # noqa: BLE001 – the keeper must never die
+            logger.warning("Background refresh crashed: %s", exc)
+
+
+def _run_search(**kwargs):
+    """Live search bounded by SEARCH_DEADLINE; falls back to the page cache."""
+    future = _search_pool.submit(_scraper.search, **kwargs)
+    deadline = config.SEARCH_DEADLINE if config.SEARCH_DEADLINE > 0 else None
+    try:
+        return future.result(timeout=deadline)
+    except FutureTimeout:
+        results = _scraper.search(cached_only=True, **kwargs)
+        logger.warning(
+            "Search still running after %.0fs; answered with %d cached results, "
+            "the fetch finishes in the background", deadline, len(results),
+        )
+        return results
+
+
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
     description="Torznab API proxy that scrapes ext.to via FlareSolverr or Byparr",
-    version="1.3.2",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -262,7 +305,7 @@ def torznab_api(
             clean_imdbid = imdbid if imdbid.startswith("tt") else f"tt{imdbid}"
 
         try:
-            results = _scraper.search(
+            results = _run_search(
                 query=search_query,
                 categories=categories or None,
                 imdbid=clean_imdbid,

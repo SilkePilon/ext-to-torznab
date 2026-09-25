@@ -22,11 +22,13 @@ application that supports the Newznab/Torznab API.
 | Fast path             | Plain HTTP when a mirror allows it; a browser only when challenged   |
 | Solver choice         | FlareSolverr or [Byparr](https://github.com/ThePhaseless/Byparr), auto-detected |
 | Magnet links          | Resolved during search, concurrently, and cached                     |
+| Never times out \*arr | Answers within `SEARCH_DEADLINE`, from a stale cache if need be      |
+| Warm feeds            | RSS/test feeds and the Cloudflare clearance are refreshed in the background |
+| One solve per burst   | Concurrent requests that hit a challenge share a single browser solve |
 | Full category support | All ext.to categories mapped to Torznab IDs, filtered server-side    |
 | TV search             | Query + season + episode auto-formatted (`S01E03`)                   |
 | IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to               |
 | Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                              |
-| Turnstile bypass      | `FLARESOLVERR_TABS_TILL_VERIFY` hint for Cloudflare Turnstile        |
 | Optional API key      | Protect the proxy with `API_KEY` environment variable                |
 | Pagination            | Full `offset` / `limit` support                                      |
 | Docker-ready          | Single `docker compose up -d`                                        |
@@ -132,19 +134,92 @@ python -m unittest discover -s tests
 | `MAGNET_MAX_RESOLVE` | `30` | Magnets resolved per search before the rest go lazy |
 | `MAGNET_TIME_BUDGET` | `5` | Max seconds a search waits for magnets; slower lookups finish in the background and the rows keep their `t=download` link |
 | `MAGNET_CACHE_TTL` | `3600` | Seconds a resolved magnet stays cached |
-| `PAGE_CACHE_TTL` | `120` | Seconds a fetched search page stays cached (`0` disables) |
+| `PAGE_CACHE_TTL` | `300` | Seconds a fetched search page is answered from cache without asking the site (`0` disables) |
+| `PAGE_CACHE_STALE` | `86400` | Seconds an older cached page may still be served, only when the site fails or overruns `SEARCH_DEADLINE` |
+| `SEARCH_DEADLINE` | `25` | Most seconds a search waits on the site; past it the answer comes from the cache (empty if nothing is cached) and the fetch finishes in the background. `0` waits forever |
+| `KEEPALIVE_INTERVAL` | `600` | Seconds between background refreshes of the keyword-less feeds \*arr apps poll (RSS sync, connection test); also re-solves an expired Cloudflare clearance before a real search needs it. `0` disables |
 | `API_KEY` | _(empty)_ | Optional key required on all requests |
 | `PORT` | `5000` | Port the proxy listens on |
 | `HOST` | `0.0.0.0` | Bind address |
 | `FLARESOLVERR_TIMEOUT` | `60000` | Max ms FlareSolverr waits per page. A Turnstile solve measured 27-57 s from a VPN exit; use `120000` when FlareSolverr egresses through a VPN |
-| `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Tabs-till-verify hint for Cloudflare Turnstile bypass (0 = disabled; try `3` if ext.to serves challenges). FlareSolverr only |
+| `FLARESOLVERR_TABS_TILL_VERIFY` | `0` | Leave at `0`. Any other value switches FlareSolverr into its Turnstile-*token* mode, which is meant for pages with an embedded widget; ext.to's challenge page is solved by FlareSolverr's normal challenge loop, which clicks the checkbox itself. FlareSolverr only |
 | `FLARESOLVERR_SESSION_IDLE` | `300` | Seconds of inactivity before the FlareSolverr browser session is released (0 = keep forever). FlareSolverr only |
 | `FLARESOLVERR_SESSION_TTL` | `60` | Minutes after which FlareSolverr itself expires our session (`session_ttl_minutes`), so a session orphaned by a crash cannot live forever (0 = disabled). FlareSolverr only |
 | `INCLUDE_ADULT` | `true` | Include XXX categories in results |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
-`GET /healthz` reports which mirror is active, which transport it uses, and
-which mirrors are in cooldown.
+`GET /healthz` reports which mirror is active, which transport it uses,
+which mirrors are in cooldown, how old each mirror's `cf_clearance` is
+(`clearance_age_s`) and when a plain request last got through
+(`last_direct_ok_s`).  When a clearance stops working the log says how long
+it lasted (`cf_clearance worked for N min`).
+
+---
+
+## Speed: why \*arr apps used to time out, and what the proxy does about it
+
+Measured September 2026: every mirror (`extto.com`, `ext.to`, `ext2.to`)
+answers a fresh visitor with Cloudflare's **interactive** challenge – a
+"Verify you are human" Turnstile checkbox – on every path.  Once a browser has
+passed it, the resulting `cf_clearance` cookie works for the proxy's plain
+HTTP requests as long as they carry the same User Agent and come from the
+same IP; a search page then costs ~1 s.  Solving is the expensive part:
+
+| Solve | Time |
+| --- | --- |
+| Browser that clicks the checkbox straight away | ~6 s |
+| Waiting for the checkbox to pass on its own | never (timeout) |
+| Byparr behind a VPN (see below) | 25-60 s |
+
+Sonarr, Radarr, Lidarr and Prowlarr give up on an indexer request after
+**100 s**, and every timeout or 5xx pushes the indexer into an escalating
+back-off (1 min, 5 min, 15 min … 24 h).  An empty answer does not.  So the
+proxy now makes sure a request never has to wait for a solve:
+
+* **Deadline.** A search that has not finished after `SEARCH_DEADLINE`
+  seconds is answered from the page cache – stale if need be, empty if there
+  is nothing – and the fetch carries on in the background.  The \*arr app's
+  next query (they retry and re-poll constantly) is then a cache hit.
+* **Stale cache.** Pages stay usable for `PAGE_CACHE_STALE` seconds after they
+  stop being fresh, and are served whenever the site fails.
+* **Background keeper.** Every `KEEPALIVE_INTERVAL` seconds the keyword-less
+  pages the \*arr apps poll for RSS sync and for the connection test are
+  re-fetched.  That keeps those answers instant and, because it goes through
+  the same HTTP session, notices an expired clearance and re-solves it in the
+  background rather than inside somebody's search.
+* **One solve per burst.** Requests that find the clearance expired queue
+  behind a single solve and then retry with its cookies, instead of each
+  launching its own browser one after the other.
+* **Identical searches share one fetch** (Sonarr and Radarr asking the same
+  thing at once, or a retry arriving while the first try is still running).
+
+### Byparr: the 30-60 s solves are an IP lookup, not the challenge
+
+Byparr's browser looks up its own public IP (`api.ipify.org`, then
+`icanhazip.com`, then `checkip.amazonaws.com`, ~10 s timeout each) before every
+launch.  Behind a VPN that blocks or slows those hosts this alone takes
+25-46 s per request, while the solve itself takes 3-7 s
+([Byparr#416](https://github.com/ThePhaseless/Byparr/issues/416)).  Until
+that is fixed upstream, resolving **all three** hosts to nowhere cuts a solve
+to a few seconds (blocking only the first made it *slower* in that report,
+and the workaround must not be used when Byparr's own `PROXY_SERVER` is set):
+
+```yaml
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    extra_hosts:
+      - "api.ipify.org:127.0.0.1"
+      - "icanhazip.com:127.0.0.1"
+      - "checkip.amazonaws.com:127.0.0.1"
+    environment:
+      - TZ=Europe/Amsterdam   # the VPN exit's timezone: the lookup normally sets it
+```
+
+### FlareSolverr
+
+Use a current release (Turnstile handling landed in 3.5.0).  Keep
+`FLARESOLVERR_TABS_TILL_VERIFY=0` – see the table above.  On slow hardware
+FlareSolverr's own `BROWSER_WAIT_TIMEOUT=3` avoids re-solve loops.
 
 ---
 
@@ -154,21 +229,22 @@ Measured September 2026 against the live site (amd64, Docker):
 
 | What | Cost |
 | --- | --- |
-| Search page fetch (`extto.com`, plain HTTP) | ~1.0 s, of which ~0.75 s is the site's own time-to-first-byte for its 1 MB page |
+| Search page fetch (plain HTTP with a valid clearance) | ~1.0 s, of which ~0.75 s is the site's own time-to-first-byte for its 1 MB page |
+| Search answered from the page cache | ~3 ms |
 | Parsing one 50-row page | ~55 ms |
 | Resolving 25 magnets (12 workers) | ~0.5 s |
-| A challenged mirror (`ext.to`, `ext2.to`) through FlareSolverr | ~12 s per solve |
+| Cloudflare solve (browser that clicks the checkbox) | ~6 s, once per clearance |
 | Proxy container, idle | ~45 MiB |
 | FlareSolverr container, idle, no browser session | ~40 MiB |
 | FlareSolverr container with an open session | ~285-355 MiB |
 
-The two challenged mirrors reject plain HTTP even with a Chrome TLS fingerprint
-(`curl_cffi`), so a JavaScript challenge solver is still required for them and
-FlareSolverr stays in the stack.  Its cost is kept low instead:
+The mirrors reject plain HTTP even with a browser TLS fingerprint
+(`curl_cffi` impersonating Chrome, Firefox or Safari), so a challenge solver is
+required.  A browser fingerprint buys nothing once a clearance is held either:
+plain `requests` with the solver's User Agent is accepted just the same.  The
+solver's cost is kept low instead:
 
-* `extto.com` is tried first and normally answers without a challenge, so most
-  deployments never open a browser.
-* When a challenge *is* solved, the resulting `cf_clearance` cookie is imported
+* When a challenge is solved, the resulting `cf_clearance` cookie is imported
   into the proxy's own HTTP session and the browser session is released after
   `FLARESOLVERR_SESSION_IDLE` seconds, dropping FlareSolverr back to ~40-100 MiB.
 * A browser session that errors out (timeout, DNS failure, Turnstile glitch) is
@@ -241,9 +317,12 @@ Sonarr / Radarr / Lidarr
         ▼
   ext-to-torznab  (FastAPI)
         │
-        ├─ 1. plain HTTPS GET /browse/?q=…      ← fast path (~0.3 s)
+        ├─ 0. page cache (fresh → answer; site slow/down → stale answer)
+        │
+        ├─ 1. plain HTTPS GET /browse/?q=…      ← fast path (~1 s)
         │      └─ Cloudflare challenge?  → FlareSolverr solves it once,
-        │         its cookies + User Agent are reused for the fast path
+        │         its cookies + User Agent are reused for the fast path;
+        │         the background keeper usually got there first
         │      └─ host down?              → next mirror, failed host cooled down
         │
         ├─ 2. parse rows with BeautifulSoup

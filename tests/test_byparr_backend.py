@@ -208,6 +208,7 @@ def _http_response(status, text):
     resp = mock.Mock(spec=requests.Response)
     resp.status_code = status
     resp.text = text
+    resp.headers = {}
     return resp
 
 
@@ -386,6 +387,62 @@ class ClearanceRefreshSingleFlightTest(unittest.TestCase):
         [t.join() for t in threads]
         self.assertEqual(len(results), 5)
         self.assertEqual(len(solver.fetched), 1, "workers must share a single solve")
+
+
+class PageSolveSingleFlightTest(unittest.TestCase):
+    """Page fetches that all find the clearance expired share one solve."""
+
+    def _client(self, solver):
+        client = SiteClient("https://ext.to", flaresolverr=solver, prefer_direct=True)
+        client._session = mock.Mock()
+        client._session.headers = {}
+        client._session.cookies = mock.Mock()
+        return client
+
+    def test_concurrent_challenged_gets_share_one_solve(self):
+        import threading
+        import time as _time
+
+        class SlowSolver(_FakeSolver):
+            def get_page_with_cookies(self, url):
+                _time.sleep(0.3)
+                return super().get_page_with_cookies(url)
+
+        solver = SlowSolver()
+        client = self._client(solver)
+        # Challenged until a solve has happened, fine afterwards.
+        client._session.get.side_effect = lambda url, **kw: (
+            _http_response(200, "<html>direct</html>")
+            if client._last_solve_at
+            else _http_response(403, "Just a moment")
+        )
+        pages = []
+        threads = [
+            threading.Thread(target=lambda: pages.append(client.get("/browse/", {"q": "x"})))
+            for _ in range(5)
+        ]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(len(solver.fetched), 1, "requests must share a single solve")
+        self.assertEqual(sorted(pages), ["<html>direct</html>"] * 4 + ["<html>solved</html>"])
+
+    def test_solve_before_the_failure_does_not_count(self):
+        import time as _time
+
+        solver = _FakeSolver()
+        client = self._client(solver)
+        client._session.get.return_value = _http_response(403, "Just a moment")
+        client._last_solve_at = _time.time() - 60
+        self.assertEqual(client.get("/browse/"), "<html>solved</html>")
+        self.assertEqual(len(solver.fetched), 1)
+
+    def test_clearance_age_is_reported(self):
+        solver = _FakeSolver()
+        client = self._client(solver)
+        self.assertIsNone(client.clearance_status()["clearance_age_s"])
+        client._session.get.return_value = _http_response(403, "Just a moment")
+        client.get("/browse/")
+        self.assertEqual(client.clearance_status()["clearance_age_s"], 0)
 
 
 class CookieDomainTest(unittest.TestCase):

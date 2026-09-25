@@ -5,6 +5,8 @@ Run with:  python -m unittest discover -s tests
 
 import os
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,7 +19,7 @@ from app.scraper import (  # noqa: E402
     _parse_size,
     _torrent_id_from_url,
 )
-from app.site_client import SitePool, extract_js_tokens, _looks_like_challenge  # noqa: E402
+from app.site_client import SitePool, SiteUnavailable, extract_js_tokens, _looks_like_challenge  # noqa: E402
 from app.flaresolverr_client import FlareSolverrClient  # noqa: E402
 
 # One result row in the markup ext.to serves today (August 2026).
@@ -153,6 +155,10 @@ class ChallengeDetectionTest(unittest.TestCase):
         self.assertTrue(_looks_like_challenge(403, ""))
         self.assertTrue(_looks_like_challenge(522, ""))
 
+    def test_cf_mitigated_header(self):
+        self.assertTrue(_looks_like_challenge(200, "<html></html>", {"cf-mitigated": "challenge"}))
+        self.assertFalse(_looks_like_challenge(200, "<html></html>", {}))
+
     def test_challenge_body(self):
         self.assertTrue(_looks_like_challenge(200, "<title>Just a moment...</title>"))
 
@@ -246,7 +252,7 @@ class PageCacheTest(unittest.TestCase):
         self.assertEqual(first[0]["torrent_id"], 21152668)
         # Cached value is the parsed list, not the HTML string.
         key = ("/browse/", (("q", "silo"),))
-        cached_results, _client = scraper._page_cache.get(key)
+        _age, (cached_results, _client) = scraper._page_cache.get(key, max_age=60)
         self.assertIsInstance(cached_results, list)
 
     def test_cached_results_are_not_mutated_by_enrichment(self):
@@ -257,6 +263,144 @@ class PageCacheTest(unittest.TestCase):
         results[0]["magnet_url"] = "magnet:?xt=urn:btih:abc"
         again, _ = scraper._fetch_results("/browse/", {"q": "silo"})
         self.assertEqual(again[0]["magnet_url"], "")
+
+
+class StaleCacheTest(unittest.TestCase):
+    """Old results beat none: a failing site falls back to the stale page."""
+
+    def _scraper(self, fresh=0, stale=3600):
+        pool = SitePool(["https://extto.com"], flaresolverr=None)
+        return ExtToScraper(pool, page_cache_ttl=fresh, page_cache_stale=stale, resolve_magnets="never")
+
+    def test_stale_page_is_served_when_site_fails(self):
+        scraper = self._scraper()
+        client = scraper.pool.active
+        scraper._pool.get = lambda path, params=None: (ROW_HTML, client)  # type: ignore[method-assign]
+        scraper._fetch_results("/browse/", {"q": "silo"})
+
+        def down(path, params=None):
+            raise SiteUnavailable("all mirrors failed")
+
+        scraper._pool.get = down  # type: ignore[method-assign]
+        results, _ = scraper._fetch_results("/browse/", {"q": "silo"})
+        self.assertEqual(results[0]["torrent_id"], 21152668)
+
+    def test_failure_without_cache_still_raises(self):
+        scraper = self._scraper()
+
+        def down(path, params=None):
+            raise SiteUnavailable("all mirrors failed")
+
+        scraper._pool.get = down  # type: ignore[method-assign]
+        with self.assertRaises(SiteUnavailable):
+            scraper._fetch_results("/browse/", {"q": "silo"})
+
+    def test_fresh_entry_skips_fetch_but_stale_one_refetches(self):
+        scraper = self._scraper(fresh=60)
+        client = scraper.pool.active
+        calls = []
+
+        def fake_get(path, params=None):
+            calls.append(path)
+            return ROW_HTML, client
+
+        scraper._pool.get = fake_get  # type: ignore[method-assign]
+        scraper._fetch_results("/browse/", {"q": "silo"})
+        scraper._fetch_results("/browse/", {"q": "silo"})
+        self.assertEqual(len(calls), 1)
+        scraper._fetch_results("/browse/", {"q": "silo"}, force=True)
+        self.assertEqual(len(calls), 2)
+
+    def test_cached_only_search_never_fetches(self):
+        scraper = self._scraper()
+        client = scraper.pool.active
+        scraper._pool.get = lambda path, params=None: (ROW_HTML, client)  # type: ignore[method-assign]
+        live = scraper.search("silo")
+
+        def boom(path, params=None):
+            raise AssertionError("cached_only must not fetch")
+
+        scraper._pool.get = boom  # type: ignore[method-assign]
+        self.assertEqual(scraper.search("silo", cached_only=True), live)
+        self.assertEqual(scraper.search("something else", cached_only=True), [])
+
+    def test_concurrent_identical_fetches_share_one_request(self):
+        scraper = self._scraper()
+        client = scraper.pool.active
+        calls = []
+        gate = threading.Event()
+
+        def slow_get(path, params=None):
+            calls.append(path)
+            gate.wait(2)
+            return ROW_HTML, client
+
+        scraper._pool.get = slow_get  # type: ignore[method-assign]
+        out = []
+        threads = [
+            threading.Thread(target=lambda: out.append(scraper._fetch_results("/browse/", {"q": "silo"})[0]))
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        time.sleep(0.2)
+        gate.set()
+        for t in threads:
+            t.join(3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(out), 4)
+        # Each caller gets its own copies.
+        out[0][0]["magnet_url"] = "x"
+        self.assertEqual(out[1][0]["magnet_url"], "")
+
+
+class RefreshFeedsTest(unittest.TestCase):
+    def _scraper(self):
+        pool = SitePool(["https://extto.com"], flaresolverr=None)
+        scraper = ExtToScraper(pool, page_cache_ttl=300, page_cache_stale=3600, resolve_magnets="never")
+        client = scraper.pool.active
+        self.fetched = []
+
+        def fake_get(path, params=None):
+            self.fetched.append(dict(params or {}))
+            return ROW_HTML, client
+
+        scraper._pool.get = fake_get  # type: ignore[method-assign]
+        return scraper
+
+    def test_keywordless_searches_are_refreshed_keyword_searches_are_not(self):
+        scraper = self._scraper()
+        scraper.search("", categories=[2000])
+        scraper.search("silo")
+        self.fetched.clear()
+        self.assertEqual(scraper.refresh_feeds(max_age=0), 1)
+        self.assertEqual(len(self.fetched), 1)
+        self.assertEqual(self.fetched[0].get("cat"), "1")
+        self.assertNotIn("q", self.fetched[0])
+
+    def test_young_copies_are_left_alone(self):
+        scraper = self._scraper()
+        scraper.search("", categories=[2000])
+        self.fetched.clear()
+        self.assertEqual(scraper.refresh_feeds(max_age=600), 0)
+        self.assertEqual(self.fetched, [])
+
+    def test_default_feed_without_history_keeps_clearance_warm(self):
+        scraper = self._scraper()
+        self.assertEqual(scraper.refresh_feeds(max_age=0), 1)
+        self.assertEqual(self.fetched[0].get("cat"), "2")
+        # The background refresh itself is not a request to keep alive.
+        self.assertEqual(scraper._feeds, {})
+
+    def test_feeds_nobody_asked_for_in_a_while_are_dropped(self):
+        scraper = self._scraper()
+        scraper.search("", categories=[2000])
+        for key, (path, params, _last) in list(scraper._feeds.items()):
+            scraper._feeds[key] = (path, params, time.time() - 10_000)
+        self.fetched.clear()
+        scraper.refresh_feeds(max_age=0, keep_for=3600)
+        # Falls back to the default TV feed, not the forgotten movie feed.
+        self.assertEqual([p.get("cat") for p in self.fetched], ["2"])
 
 
 class MagnetTimeBudgetTest(unittest.TestCase):
