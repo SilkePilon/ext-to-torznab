@@ -107,6 +107,9 @@ class FlareSolverrClient:
         # memory bounded to one Firefox at a time.
         # Acquired before _session_lock, never the other way round.
         self._cmd_lock = threading.Lock()
+        # Guards auto-detection only.  Not _session_lock: session creation
+        # asks for the backend while already holding that lock.
+        self._detect_lock = threading.Lock()
 
         self._session_idle = max(0.0, session_idle)
         self._reaper_interval = max(0.01, reaper_interval)
@@ -123,7 +126,7 @@ class FlareSolverrClient:
     def backend(self) -> str:
         """``"flaresolverr"`` or ``"byparr"`` – probed on first use in auto mode."""
         if self._backend is None:
-            with self._session_lock:
+            with self._detect_lock:
                 if self._backend is None:
                     self._backend = self._detect_backend()
         return self._backend

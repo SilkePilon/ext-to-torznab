@@ -10,6 +10,7 @@ direct request after refreshing the clearance cookies.
 import copy
 import os
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -180,6 +181,22 @@ class FlareSolverrModeStillUsesSessions(unittest.TestCase):
         client.get_page_with_cookies("https://ext.to/browse/")
         self.assertEqual([p["cmd"] for p in fake.posted], ["sessions.create", "request.get"])
         self.assertTrue(client.supports_post)
+
+    def test_auto_detection_during_first_session_create_does_not_deadlock(self):
+        # create_session holds _session_lock and asks for the backend; the
+        # probe must not take that same lock again.
+        client = FlareSolverrClient("http://solver.test:8191", session_idle=0, backend="auto")
+        fake = _FakePost([{"status": "ok", "session": "s1"}, _solution()])
+        client._http = mock.Mock()
+        client._http.get.side_effect = [_probe_response(200, {"msg": "FlareSolverr is ready!"})]
+        client._http.post.side_effect = fake
+        worker = threading.Thread(
+            target=client.get_page_with_cookies, args=("https://ext.to/browse/",), daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "first solver call deadlocked")
+        self.assertEqual([p["cmd"] for p in fake.posted], ["sessions.create", "request.get"])
 
 
 class _FakeSolver:
