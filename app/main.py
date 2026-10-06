@@ -26,6 +26,7 @@ from fastapi.responses import RedirectResponse, Response
 
 from .config import config
 from .flaresolverr_client import FlareSolverrClient
+from .release_match import split_query
 from .scraper import ExtToScraper
 from .site_client import SitePool, SiteUnavailable
 from .torznab import (
@@ -188,7 +189,7 @@ def _run_search(**kwargs):
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
     description="Torznab API proxy that scrapes ext.to via FlareSolverr or Byparr",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -298,6 +299,16 @@ def torznab_api(
         season_num = _parse_optional_int(season)
         episode_num = _parse_optional_int(ep)
 
+        # Structured TV / movie searches get their results checked against the
+        # requested title (and season / episode).  A free-text query ending in
+        # "S04" or "Season 4" is treated as the season search it really is.
+        match_title = t in ("tvsearch", "movie")
+        if season_num is None and t in ("search", "tvsearch"):
+            show, q_season, q_episode = split_query(search_query)
+            if q_season is not None:
+                search_query, season_num, episode_num = show, q_season, q_episode
+                match_title = True
+
         # Strip the leading "tt" from imdbid if present for normalisation;
         # the scraper will add it back
         clean_imdbid: Optional[str] = None
@@ -313,6 +324,7 @@ def torznab_api(
                 episode=episode_num,
                 offset=offset,
                 limit=limit,
+                match_title=match_title,
             )
         except SiteUnavailable as exc:
             logger.error("All mirrors unavailable during search: %s", exc)

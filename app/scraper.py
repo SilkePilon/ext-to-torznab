@@ -16,12 +16,19 @@ HTML structure (verified August 2026):
       a.torrent-title-link[href, data-tooltip]  → title + detail URL
       div.related-posted > a                    → category hrefs
       a.search-magnet-btn[data-id]              → numeric torrent ID
+      a.vide-watch-btn[href]                    → show page, e.g. /the-rookie-s109/
     td[2]  span:not(.add-block)  → size text
     td[3]  span:not(.add-block)  → file count
     td[4]  span[title]           → exact date in title attr
     td[5]  span.text-success     → seeders
     td[6]  span.text-danger      → leechers
     td[7]  a.source-link-tor     → original tracker
+
+Show pages (verified October 2026):
+  /<show>/torrents/?s=4&completed=1  → every season-4 pack, incl. collections
+  /<show>/torrents/?s=4&e=5          → S04E05 releases plus the packs holding it
+  Same table markup, except the title link has no class and there is no
+  related-posted block.  The page carries its own searchPageToken.
 
 Magnet API (verified August 2026):
   POST /ajax/getSearchMagnet.php
@@ -51,6 +58,7 @@ from urllib.parse import quote_plus, urlsplit
 from bs4 import BeautifulSoup, SoupStrainer, Tag
 
 from .categories import EXT_TO_CAT_MAP, cat_id_matches, torznab_cat_to_site_cat
+from .release_match import normalise, query_variants, split_matches, title_matches
 from .site_client import SiteClient, SitePool, SiteUnavailable, extract_js_tokens
 
 logger = logging.getLogger(__name__)
@@ -65,6 +73,12 @@ _TRACKERS = [
 ]
 
 _RESULTS_PER_PAGE = 50
+# Pages read per query variant in a matched (season / episode) search.
+_MATCHED_MAX_PAGES = 2
+# How long a show's page path (e.g. /the-rookie-s109/) is remembered.
+_SHOW_PATH_TTL = 24 * 3600
+# Show page path linked from a result row's play button.
+_RE_SHOW_PATH = re.compile(r"^/[a-z0-9-]+-s\d+/$")
 _MAGNET_API_PATH = "/ajax/getSearchMagnet.php"
 # ext.to allows 60 magnet calls per PHP session, then answers "Too many
 # requests. Please wait a moment." until a new session starts.  Rotate a few
@@ -83,6 +97,8 @@ _TABLE_ONLY = SoupStrainer("table")
 
 # Pre-compiled regex patterns used in hot paths (parsed 50× per search page).
 _RE_HTML_TAGS      = re.compile(r"<[^>]+>")
+# Quality badge show pages append to the tooltip title ("… x264 <span …>720P</span>").
+_RE_TITLE_BADGE    = re.compile(r'<span class="imdbSearchButton">.*?</span>')
 _RE_INFOHASH       = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _RE_REL_TIME       = re.compile(r"(\d+)([smhdwMy])")
 _RE_WORD_TIME      = re.compile(
@@ -301,6 +317,29 @@ class _PageCache:
             return time.time() - entry[0] if entry else None
 
 
+def _pick_show_path(rows: List[Dict], title_query: str) -> Optional[str]:
+    """Most common show page among rows whose title matches the query."""
+    counts: Dict[str, int] = {}
+    for row in rows:
+        path = row.get("show_path")
+        if not path or (title_query and not title_matches(row.get("title", ""), title_query)):
+            continue
+        counts[path] = counts.get(path, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def _unique(items: List[Dict]) -> List[Dict]:
+    seen: set = set()
+    out = []
+    for item in items:
+        key = item.get("torrent_id") or item.get("details_path")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main scraper
 # ---------------------------------------------------------------------------
@@ -342,6 +381,8 @@ class ExtToScraper:
         self._max_resolve = max(0, magnet_max_resolve)
         self._time_budget = magnet_time_budget if magnet_time_budget > 0 else None
         self._enrich_paused_until = 0.0
+        # Search key (normalised title or IMDb ID) → show page path.
+        self._show_paths = _TTLCache(_SHOW_PATH_TTL, max_entries=1024)
 
     @property
     def pool(self) -> SitePool:
@@ -360,6 +401,7 @@ class ExtToScraper:
         episode: Optional[int] = None,
         offset: int = 0,
         limit: int = 25,
+        match_title: bool = False,
         cached_only: bool = False,
     ) -> List[Dict]:
         """Search the site.
@@ -369,13 +411,30 @@ class ExtToScraper:
         cache.  That is the answer given when a live search overruns its
         deadline.
         """
-        effective_query = query.strip()
-        if effective_query and season is not None:
-            if episode is not None:
-                effective_query = f"{effective_query} S{season:02d}E{episode:02d}"
-            else:
-                effective_query = f"{effective_query} S{season:02d}"
+        query = query.strip()
+        if season is not None and season >= 1000:
+            # Daily shows: Sonarr sends season=YYYY and ep=MM/DD.  Search the
+            # year as a keyword; SxxEyy matching does not apply.
+            query = f"{query} {season}".strip()
+            season = episode = None
 
+        if season is None and not (match_title and query and not imdbid):
+            return self._plain_search(query, categories, imdbid, offset, limit, cached_only)
+        return self._matched_search(
+            query, categories, imdbid, season, episode, offset, limit,
+            match_title=match_title, cached_only=cached_only,
+        )
+
+    def _plain_search(
+        self,
+        query: str,
+        categories: Optional[List[int]],
+        imdbid: Optional[str],
+        offset: int,
+        limit: int,
+        cached_only: bool = False,
+    ) -> List[Dict]:
+        """One query, results passed through as the site ranks them."""
         start_page = (offset // _RESULTS_PER_PAGE) + 1
         pages_needed = max(1, -(-limit // _RESULTS_PER_PAGE))
 
@@ -383,7 +442,7 @@ class ExtToScraper:
         client: Optional[SiteClient] = None
 
         for page in range(start_page, start_page + pages_needed):
-            params = self._build_params(effective_query, page, imdbid, categories)
+            params = self._build_params(query, page, imdbid, categories)
             if cached_only:
                 hit = self._cached_results("/browse/", params, max_age=self._page_cache.stale)
                 if hit is None:
@@ -393,7 +452,7 @@ class ExtToScraper:
                 if len(page_results) < _RESULTS_PER_PAGE:
                     break
                 continue
-            if not effective_query and not imdbid:
+            if not query and not imdbid:
                 with self._feeds_lock:
                     self._feeds[self._page_key("/browse/", params)] = ("/browse/", params, time.time())
             try:
@@ -406,35 +465,191 @@ class ExtToScraper:
             if len(page_results) < _RESULTS_PER_PAGE:
                 break
 
-        # Category filter.  ext.to filters top-level categories server-side via
-        # cat=N, but sub-category requests (e.g. 5040 "TV/HD") still need to be
-        # narrowed here.
-        if categories and all_results:
-            filtered = [
-                r for r in all_results
-                if any(
-                    cat_id_matches(rc, fc)
-                    for rc in r.get("categories", [8000])
-                    for fc in categories
-                )
-            ]
-            # Keep the unfiltered set if our mapping recognised nothing –
-            # returning zero results would look like an outage to *arr apps.
-            if filtered:
-                all_results = filtered
+        all_results = self._filter_categories(all_results, categories)
 
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         results = all_results[local_offset: local_offset + limit]
 
+        self._add_magnets(results, client, cached_only)
+        return results
+
+    def _add_magnets(
+        self, results: List[Dict], client: Optional[SiteClient], cached_only: bool,
+    ) -> None:
         if cached_only:
             for item in results:
                 cached = self._magnet_cache.get(item.get("torrent_id"))
                 if cached:
                     self._apply_magnet(item, cached)
-        elif client is not None and self._should_resolve(client):
+        elif results and client is not None and self._should_resolve(client):
             self._enrich_with_magnets(results, client)
 
+    def _rows(
+        self, path: str, params: Dict[str, str], cached_only: bool,
+    ) -> Tuple[List[Dict], Optional[SiteClient]]:
+        """One results page; from the cache only (however stale) if *cached_only*."""
+        if not cached_only:
+            return self._fetch_results(path, params)
+        hit = self._cached_results(path, params, max_age=self._page_cache.stale)
+        return hit if hit is not None else ([], None)
+
+    def _matched_search(
+        self,
+        query: str,
+        categories: Optional[List[int]],
+        imdbid: Optional[str],
+        season: Optional[int],
+        episode: Optional[int],
+        offset: int,
+        limit: int,
+        match_title: bool,
+        cached_only: bool = False,
+    ) -> List[Dict]:
+        """Structured search: keep only releases that match what was asked.
+
+        TV searches go through the show's own page when one can be found:
+        ``/<show>/torrents/?s=4&completed=1`` lists every season-4 pack and
+        ``?s=4&e=5`` that episode plus the packs containing it, which the
+        keyword search (sorted by age, flooded with single episodes) never
+        surfaces.  The show path is read off the keyword search results and
+        cached.  Without one, several keyword variants are run and filtered.
+
+        Offsets apply to the filtered list.  Wanted releases (packs for a
+        season search, the episode for an episode search) come first; the
+        fallback kind is only returned when nothing wanted was found, so
+        Sonarr still gets something it can grab.
+        """
+        variants = [query] if imdbid else query_variants(query, season, episode)
+        title_query = query if match_title and not imdbid else ""
+        wanted: List[Dict] = []
+        fallback: List[Dict] = []
+        client: Optional[SiteClient] = None
+
+        show_key = (imdbid or normalise(query)) if season is not None else ""
+        show_path = self._show_paths.get(show_key) if show_key else None
+        pending = list(variants)
+
+        if show_key and show_path is None:
+            rows, hits, misses, client = self._search_variant(
+                pending.pop(0), imdbid, categories, title_query, season, episode, cached_only,
+            )
+            wanted.extend(hits)
+            fallback.extend(misses)
+            show_path = _pick_show_path(rows, title_query)
+            if show_path:
+                self._show_paths.set(show_key, show_path)
+
+        if show_path:
+            rows, show_client = self._show_rows(show_path, season, episode, cached_only)
+            if rows:
+                client = client or show_client
+                if episode is None:
+                    # The site's own "complete season" list: trust it as is.
+                    wanted.extend(rows)
+                else:
+                    hits, misses = split_matches(rows, "", season, episode)
+                    wanted.extend(hits)
+                    fallback.extend(misses)
+                pending = []
+
+        if pending:
+            def run(variant: str):
+                return self._search_variant(
+                    variant, imdbid, categories, title_query, season, episode, cached_only,
+                )
+
+            with ThreadPoolExecutor(max_workers=len(pending)) as executor:
+                for _rows, hits, misses, variant_client in executor.map(run, pending):
+                    wanted.extend(hits)
+                    fallback.extend(misses)
+                    client = client or variant_client
+
+        wanted = _unique(wanted)
+        fallback = _unique(fallback)
+        matched = wanted or fallback
+        matched.sort(key=lambda r: r.get("seeders", 0), reverse=True)
+
+        logger.info(
+            "Matched search %r (season=%s, ep=%s, show=%s): %d wanted, %d fallback",
+            query, season, episode, show_path or "-", len(wanted), len(fallback),
+        )
+
+        results = matched[offset: offset + limit]
+        self._add_magnets(results, client, cached_only)
         return results
+
+    def _search_variant(
+        self,
+        variant: str,
+        imdbid: Optional[str],
+        categories: Optional[List[int]],
+        title_query: str,
+        season: Optional[int],
+        episode: Optional[int],
+        cached_only: bool = False,
+    ) -> Tuple[List[Dict], List[Dict], List[Dict], Optional[SiteClient]]:
+        """Run one keyword query; return (all rows, wanted, fallback, client)."""
+        rows_all: List[Dict] = []
+        wanted: List[Dict] = []
+        fallback: List[Dict] = []
+        client: Optional[SiteClient] = None
+        for page in range(1, _MATCHED_MAX_PAGES + 1):
+            params = self._build_params(variant, page, imdbid, categories)
+            try:
+                rows, page_client = self._rows("/browse/", params, cached_only)
+            except SiteUnavailable as exc:
+                logger.error("Search page fetch failed for %r: %s", variant, exc)
+                break
+            client = client or page_client
+            rows_all.extend(rows)
+            rows = self._filter_categories(rows, categories)
+            hits, misses = split_matches(rows, title_query, season, episode)
+            wanted.extend(hits)
+            fallback.extend(misses)
+            # A page without a single wanted release means the variant has
+            # run out of useful results; don't pay for another.
+            if len(rows) < _RESULTS_PER_PAGE or not hits:
+                break
+        return rows_all, wanted, fallback, client
+
+    def _show_rows(
+        self, show_path: str, season: int, episode: Optional[int], cached_only: bool = False,
+    ) -> Tuple[List[Dict], Optional[SiteClient]]:
+        """Torrents listed on a show page for one season or one episode."""
+        params = {"s": str(season)}
+        if episode is None:
+            params["completed"] = "1"
+        else:
+            params["e"] = str(episode)
+        try:
+            rows, client = self._rows(f"{show_path}torrents/", params, cached_only)
+        except SiteUnavailable as exc:
+            logger.error("Show page fetch failed for %s: %s", show_path, exc)
+            return [], None
+        for row in rows:
+            # Show-page rows carry no category links; they are TV by definition.
+            if row.get("categories") == [8000]:
+                row["categories"] = [5000]
+        return rows, client
+
+    @staticmethod
+    def _filter_categories(results: List[Dict], categories: Optional[List[int]]) -> List[Dict]:
+        # ext.to filters top-level categories server-side via cat=N, but
+        # sub-category requests (e.g. 5040 "TV/HD") still need to be narrowed
+        # here.
+        if not categories or not results:
+            return results
+        filtered = [
+            r for r in results
+            if any(
+                cat_id_matches(rc, fc)
+                for rc in r.get("categories", [8000])
+                for fc in categories
+            )
+        ]
+        # Keep the unfiltered set if our mapping recognised nothing –
+        # returning zero results would look like an outage to *arr apps.
+        return filtered or results
 
     def _build_params(
         self,
@@ -629,11 +844,17 @@ class ExtToScraper:
 
         title_link = td1.find("a", class_="torrent-title-link")
         if not title_link:
+            # Show pages (/<show>/torrents/) use a plain link inside the
+            # float-left block.
+            block = td1.find("div", class_="float-left")
+            title_link = block.find("a", href=True) if block else None
+        if not title_link:
             return None
 
         # data-tooltip holds the full untruncated title; search hit highlighting
         # wraps matches in <span>, so strip tags.
-        title = _RE_HTML_TAGS.sub("", title_link.get("data-tooltip", "")).strip()
+        tooltip = _RE_TITLE_BADGE.sub("", title_link.get("data-tooltip", ""))
+        title = _RE_HTML_TAGS.sub("", tooltip).strip()
         if not title:
             title = title_link.get_text(strip=True)
         if not title:
@@ -659,6 +880,11 @@ class ExtToScraper:
                 cat_id = EXT_TO_CAT_MAP.get(key, EXT_TO_CAT_MAP.get(cat_links[0], 8000))
             elif len(cat_links) == 1:
                 cat_id = EXT_TO_CAT_MAP.get(cat_links[0], 8000)
+
+        show_path = None
+        watch_btn = td1.find("a", class_="vide-watch-btn")
+        if watch_btn and _RE_SHOW_PATH.match(watch_btn.get("href", "")):
+            show_path = watch_btn["href"]
 
         magnet_btn = td1.find("a", class_="search-magnet-btn")
         torrent_id = None
@@ -719,6 +945,7 @@ class ExtToScraper:
             "magnet_url": "",
             "infohash": "",
             "torrent_id": torrent_id,
+            "show_path": show_path,
             "categories": [cat_id],
             "size": size,
             "files": files,

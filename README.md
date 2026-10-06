@@ -26,7 +26,8 @@ application that supports the Newznab/Torznab API.
 | Warm feeds            | RSS/test feeds and the Cloudflare clearance are refreshed in the background |
 | One solve per burst   | Concurrent requests that hit a challenge share a single browser solve |
 | Full category support | All ext.to categories mapped to Torznab IDs, filtered server-side    |
-| TV search             | Query + season + episode auto-formatted (`S01E03`)                   |
+| TV search             | Season search returns the show page's complete-season packs; episode search the episode's releases; wrong show / season / episode filtered out |
+| Free-text seasons     | `Show S04`, `Show Season 4 complete` get the same season-pack handling |
 | IMDb search           | `imdbid=tt1234567` passes `imdb_id` directly to ext.to               |
 | Adult content toggle  | `INCLUDE_ADULT=false` hides XXX results                              |
 | Optional API key      | Protect the proxy with `API_KEY` environment variable                |
