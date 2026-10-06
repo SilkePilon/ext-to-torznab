@@ -55,7 +55,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlsplit
 
-from bs4 import BeautifulSoup, SoupStrainer, Tag
+import lxml.html
+from lxml.etree import ParserError
+from lxml.html import HtmlElement
 
 from .categories import EXT_TO_CAT_MAP, cat_id_matches, torznab_cat_to_site_cat
 from .release_match import normalise, query_variants, split_matches, title_matches
@@ -91,9 +93,11 @@ _ENRICH_FAILURE_LIMIT = 6
 # working during the pause – they retry with a fresh session of their own.
 _ENRICH_PAUSE_SECONDS = 120
 
-# Search pages are ~1 MB, two thirds of it filter sidebar and scripts.  Only
-# <table> subtrees are built, which roughly halves parse time and memory.
-_TABLE_ONLY = SoupStrainer("table")
+# Detail-page elements that carry the numeric torrent ID, most specific first.
+_DETAIL_ID_XPATHS = [
+    f'//a[contains(concat(" ", normalize-space(@class), " "), " {cls} ")][@data-id]'
+    for cls in ("search-magnet-btn", "download-btn-magnet", "detail-magnet-link")
+] + ["//*[@data-id]"]
 
 # Pre-compiled regex patterns used in hot paths (parsed 50× per search page).
 _RE_HTML_TAGS      = re.compile(r"<[^>]+>")
@@ -210,12 +214,38 @@ def _torrent_id_from_url(url: str) -> Optional[int]:
         return None
 
 
-def _value_span(td: Tag) -> Optional[Tag]:
+def _has_class(el: HtmlElement, cls: str) -> bool:
+    return cls in (el.get("class") or "").split()
+
+
+def _find(el: HtmlElement, tag: str, cls: Optional[str] = None) -> Optional[HtmlElement]:
+    """First descendant <tag> (with class *cls*, if given)."""
+    for child in el.iter(tag):
+        if child is not el and (cls is None or _has_class(child, cls)):
+            return child
+    return None
+
+
+def _text(el: HtmlElement) -> str:
+    return el.text_content().strip()
+
+
+def _value_span(td: HtmlElement) -> Optional[HtmlElement]:
     """First <span> in a cell that is not the mobile "Size"/"Files" label."""
-    for span in td.find_all("span"):
-        if "add-block" not in (span.get("class") or ()):
+    for span in td.iter("span"):
+        if not _has_class(span, "add-block"):
             return span
     return None
+
+
+def _parse_document(html: str) -> Optional[HtmlElement]:
+    try:
+        return lxml.html.document_fromstring(html)
+    except ValueError:
+        # A str with an XML encoding declaration has to go in as bytes.
+        return lxml.html.document_fromstring(html.encode("utf-8"))
+    except ParserError:
+        return None
 
 
 class _Counter:
@@ -809,9 +839,11 @@ class ExtToScraper:
             logger.warning("Mirror returned a Cloudflare error page")
             return []
 
-        soup = BeautifulSoup(html, "html.parser", parse_only=_TABLE_ONLY)
-        table = soup.find("table", class_="table-striped")
-        if not table:
+        # lxml builds the whole ~1 MB page in C in ~5 ms; BeautifulSoup took
+        # 25-70 ms even when told to keep only the <table> subtrees.
+        doc = _parse_document(html)
+        table = _find(doc, "table", "table-striped") if doc is not None else None
+        if table is None:
             # A genuine zero-hit search renders the filter sidebar with a
             # "No results" button and no table – not a scraping failure.
             if "No results" in html:
@@ -821,9 +853,8 @@ class ExtToScraper:
             return []
 
         base = (client or self._pool.active).base
-        body = table.find("tbody") or table
         results = []
-        for row in body.find_all("tr", recursive=False):
+        for row in table.xpath("./tbody/tr | ./tr"):
             try:
                 item = self._parse_row(row, base)
                 if item:
@@ -834,21 +865,19 @@ class ExtToScraper:
         logger.debug("Parsed %d results", len(results))
         return results
 
-    def _parse_row(self, row: Tag, base: str) -> Optional[Dict]:
-        # Plain find()/find_all() here: soupsieve CSS selectors cost ~0.5 ms
-        # per lookup, which added up to ~25 ms per 50-row page.
-        tds = row.find_all("td", recursive=False)
+    def _parse_row(self, row: HtmlElement, base: str) -> Optional[Dict]:
+        tds = row.findall("td")
         if not tds:
             return None
         td1 = tds[0]
 
-        title_link = td1.find("a", class_="torrent-title-link")
-        if not title_link:
+        title_link = _find(td1, "a", "torrent-title-link")
+        if title_link is None:
             # Show pages (/<show>/torrents/) use a plain link inside the
             # float-left block.
-            block = td1.find("div", class_="float-left")
-            title_link = block.find("a", href=True) if block else None
-        if not title_link:
+            block = _find(td1, "div", "float-left")
+            title_link = next((a for a in block.iter("a") if a.get("href")), None) if block is not None else None
+        if title_link is None:
             return None
 
         # data-tooltip holds the full untruncated title; search hit highlighting
@@ -856,7 +885,7 @@ class ExtToScraper:
         tooltip = _RE_TITLE_BADGE.sub("", title_link.get("data-tooltip", ""))
         title = _RE_HTML_TAGS.sub("", tooltip).strip()
         if not title:
-            title = title_link.get_text(strip=True)
+            title = _text(title_link)
         if not title:
             return None
 
@@ -866,12 +895,12 @@ class ExtToScraper:
         # Category: build a lookup key from the related-posted links.
         # Links are [uploader, parent-cat, sub-cat?]; uploader links point at
         # /user/… and are skipped.  Key = parent + sub concatenated.
-        related = td1.find("div", class_="related-posted")
+        related = _find(td1, "div", "related-posted")
         cat_id = 8000
-        if related:
+        if related is not None:
             cat_links = [
                 a.get("href", "")
-                for a in related.find_all("a")
+                for a in related.iter("a")
                 if a.get("href", "").startswith("/")
                 and not a.get("href", "").startswith("/user/")
             ]
@@ -882,13 +911,13 @@ class ExtToScraper:
                 cat_id = EXT_TO_CAT_MAP.get(cat_links[0], 8000)
 
         show_path = None
-        watch_btn = td1.find("a", class_="vide-watch-btn")
-        if watch_btn and _RE_SHOW_PATH.match(watch_btn.get("href", "")):
-            show_path = watch_btn["href"]
+        watch_btn = _find(td1, "a", "vide-watch-btn")
+        if watch_btn is not None and _RE_SHOW_PATH.match(watch_btn.get("href", "")):
+            show_path = watch_btn.get("href")
 
-        magnet_btn = td1.find("a", class_="search-magnet-btn")
+        magnet_btn = _find(td1, "a", "search-magnet-btn")
         torrent_id = None
-        if magnet_btn:
+        if magnet_btn is not None:
             try:
                 torrent_id = int(magnet_btn.get("data-id", ""))
             except (ValueError, TypeError):
@@ -896,43 +925,43 @@ class ExtToScraper:
         if torrent_id is None:
             torrent_id = _torrent_id_from_url(details_path)
 
-        def cell(index: int) -> Optional[Tag]:
+        def cell(index: int) -> Optional[HtmlElement]:
             return tds[index] if len(tds) > index else None
 
         size = 0
         td2 = cell(1)
-        if td2:
+        if td2 is not None:
             val = _value_span(td2)
-            if val:
-                size = _parse_size(val.get_text(strip=True))
+            if val is not None:
+                size = _parse_size(_text(val))
 
         files = 1
         td3 = cell(2)
-        if td3:
+        if td3 is not None:
             val = _value_span(td3)
-            if val:
-                files = max(1, _parse_int(val.get_text(strip=True)))
+            if val is not None:
+                files = max(1, _parse_int(_text(val)))
 
         # Date – prefer the exact date carried in the title attribute
         pub_date = ""
         td4 = cell(3)
-        if td4:
-            span_t = td4.find("span", title=True)
-            pub_date = _parse_date(span_t["title"] if span_t else td4.get_text(strip=True))
+        if td4 is not None:
+            span_t = next((sp for sp in td4.iter("span") if sp.get("title") is not None), None)
+            pub_date = _parse_date(span_t.get("title") if span_t is not None else _text(td4))
 
         seeders = 0
         td5 = cell(4)
-        if td5:
-            val = td5.find("span", class_="text-success")
-            if val:
-                seeders = _parse_int(val.get_text(strip=True))
+        if td5 is not None:
+            val = _find(td5, "span", "text-success")
+            if val is not None:
+                seeders = _parse_int(_text(val))
 
         leechers = 0
         td6 = cell(5)
-        if td6:
-            val = td6.find("span", class_="text-danger")
-            if val:
-                leechers = _parse_int(val.get_text(strip=True))
+        if td6 is not None:
+            val = _find(td6, "span", "text-danger")
+            if val is not None:
+                leechers = _parse_int(_text(val))
 
         details_url = base.rstrip("/") + details_path
 
@@ -1246,15 +1275,11 @@ class ExtToScraper:
 
     @staticmethod
     def _torrent_id_from_detail_page(html: str) -> Optional[int]:
-        soup = BeautifulSoup(html, "html.parser")
-        for selector in (
-            "a.search-magnet-btn[data-id]",
-            "a.download-btn-magnet[data-id]",
-            "a.detail-magnet-link[data-id]",
-            "[data-id]",
-        ):
-            el = soup.select_one(selector)
-            if el:
+        doc = _parse_document(html) if html else None
+        if doc is None:
+            return None
+        for xpath in _DETAIL_ID_XPATHS:
+            for el in doc.xpath(xpath)[:1]:
                 try:
                     return int(el.get("data-id", ""))
                 except (ValueError, TypeError):

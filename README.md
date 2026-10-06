@@ -326,7 +326,7 @@ Sonarr / Radarr / Lidarr
         │         the background keeper usually got there first
         │      └─ host down?              → next mirror, failed host cooled down
         │
-        ├─ 2. parse rows with BeautifulSoup
+        ├─ 2. parse rows with lxml
         │
         └─ 3. POST /ajax/getSearchMagnet.php ×N (concurrent) → magnet links
         ▼
