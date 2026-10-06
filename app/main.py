@@ -189,7 +189,7 @@ def _run_search(**kwargs):
 app = FastAPI(
     title="EXT Torrents Torznab Proxy",
     description="Torznab API proxy that scrapes ext.to via FlareSolverr or Byparr",
-    version="1.5.0",
+    version="1.5.1",
     lifespan=lifespan,
 )
 

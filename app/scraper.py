@@ -560,8 +560,10 @@ class ExtToScraper:
         pending = list(variants)
 
         if show_key and show_path is None:
+            # One page is enough to find the show; its own page lists the rest.
             rows, hits, misses, client = self._search_variant(
                 pending.pop(0), imdbid, categories, title_query, season, episode, cached_only,
+                max_pages=1,
             )
             wanted.extend(hits)
             fallback.extend(misses)
@@ -617,13 +619,14 @@ class ExtToScraper:
         season: Optional[int],
         episode: Optional[int],
         cached_only: bool = False,
+        max_pages: int = _MATCHED_MAX_PAGES,
     ) -> Tuple[List[Dict], List[Dict], List[Dict], Optional[SiteClient]]:
         """Run one keyword query; return (all rows, wanted, fallback, client)."""
         rows_all: List[Dict] = []
         wanted: List[Dict] = []
         fallback: List[Dict] = []
         client: Optional[SiteClient] = None
-        for page in range(1, _MATCHED_MAX_PAGES + 1):
+        for page in range(1, max_pages + 1):
             params = self._build_params(variant, page, imdbid, categories)
             try:
                 rows, page_client = self._rows("/browse/", params, cached_only)
@@ -688,7 +691,12 @@ class ExtToScraper:
         imdbid: Optional[str],
         categories: Optional[List[int]],
     ) -> Dict[str, str]:
-        params: Dict[str, str] = {"sort": "age", "order": "desc"}
+        # Searches: most seeded first, so the 50 rows a page holds are the
+        # releases worth grabbing rather than the newest re-uploads (Dune Part
+        # Two: top seeder 1023 vs 176, median 112 vs 5).  Keyword-less feeds
+        # (RSS sync) stay newest first.
+        sort = "seeds" if query or imdbid else "age"
+        params: Dict[str, str] = {"sort": sort, "order": "desc"}
         if imdbid:
             params["imdb_id"] = imdbid if imdbid.startswith("tt") else f"tt{imdbid}"
         elif query:

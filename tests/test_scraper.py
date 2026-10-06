@@ -101,6 +101,11 @@ class SearchParamsTest(unittest.TestCase):
         params = self.scraper._build_params("silo", 1, None, [2000, 5000])
         self.assertNotIn("cat", params)
 
+    def test_searches_sort_by_seeders_feeds_by_age(self):
+        self.assertEqual(self.scraper._build_params("silo", 1, None, None)["sort"], "seeds")
+        self.assertEqual(self.scraper._build_params("", 1, "tt0111161", None)["sort"], "seeds")
+        self.assertEqual(self.scraper._build_params("", 1, None, None)["sort"], "age")
+
     def test_keywordless_request_avoids_the_advanced_redirect(self):
         params = self.scraper._build_params("", 1, None, None)
         self.assertEqual(params["cat"], "2")
