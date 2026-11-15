@@ -69,6 +69,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     logger.info("═══════════════════════════════════════")
     logger.info("  EXT Torrents Torznab Proxy starting  ")
     logger.info("  Solver       : %s (%s)", config.FLARESOLVERR_URL or "(disabled)", config.FLARESOLVERR_BACKEND)
+    logger.info("  Proxy        : %s", config.PROXY_URL or "(disabled)")
     logger.info("  Mirrors      : %s", ", ".join(config.EXT_TO_URLS))
     logger.info("  Direct first : %s", config.PREFER_DIRECT)
     logger.info("  Magnets      : %s (%d workers, %.1fs budget)",
@@ -87,6 +88,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             session_idle=config.FLARESOLVERR_SESSION_IDLE,
             session_ttl_minutes=config.FLARESOLVERR_SESSION_TTL,
             backend=config.FLARESOLVERR_BACKEND,
+            proxy_url=config.PROXY_URL,
         )
         if config.FLARESOLVERR_URL
         else None
@@ -97,6 +99,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         timeout=config.HTTP_TIMEOUT,
         prefer_direct=config.PREFER_DIRECT,
         cooldown=config.MIRROR_COOLDOWN,
+        proxy_url=config.PROXY_URL,
     )
     _scraper = ExtToScraper(
         _pool,

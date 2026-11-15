@@ -65,6 +65,9 @@ services:
       - "5000:5000"
     environment:
       - FLARESOLVERR_URL=http://flaresolverr:8191
+      # Optional: route both the direct client and the FlareSolverr browser
+      # through the same HTTP(S) proxy.
+      # - PROXY_URL=http://127.0.0.1:1080
       - EXT_TO_URLS=https://extto.com,https://ext.to,https://ext2.to
       - PREFER_DIRECT=true
       - RESOLVE_MAGNETS=auto
@@ -126,6 +129,7 @@ python -m unittest discover -s tests
 | `EXT_TO_URL` | _(unset)_ | Single base URL; when set it is tried before `EXT_TO_URLS` |
 | `PREFER_DIRECT` | `true` | Try plain HTTP before FlareSolverr |
 | `FLARESOLVERR_URL` | `http://flaresolverr:8191` | FlareSolverr or Byparr instance; empty disables it |
+| `PROXY_URL` | _(empty)_ | Optional HTTP(S) proxy for both the direct client and the FlareSolverr browser. Both must use the same egress IP. The URL must be reachable from both the app and the FlareSolverr container; if FlareSolverr is on a bridge, use the bridge gateway, not `127.0.0.1`. FlareSolverr only; Byparr uses its own `PROXY_SERVER`. |
 | `FLARESOLVERR_BACKEND` | `auto` | `flaresolverr`, `byparr`, or `auto` (probes `GET /` once: Byparr redirects to `/docs`) |
 | `HTTP_TIMEOUT` | `20` | Seconds before a plain HTTP request gives up |
 | `MIRROR_COOLDOWN` | `300` | Seconds a failed mirror is skipped |

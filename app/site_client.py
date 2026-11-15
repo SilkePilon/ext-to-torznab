@@ -99,6 +99,7 @@ class SiteClient:
         flaresolverr: Optional[FlareSolverrClient] = None,
         timeout: int = 20,
         prefer_direct: bool = True,
+        proxy_url: str = "",
         pool_size: int = 32,
     ) -> None:
         self.base = base_url.rstrip("/")
@@ -106,8 +107,16 @@ class SiteClient:
         self._fs = flaresolverr
         self._timeout = timeout
         self._prefer_direct = prefer_direct
+        self._proxy_url = (proxy_url or "").strip()
 
         self._session = requests.Session()
+        # Use an explicit proxy only; do not pick up ambient HTTP_PROXY values.
+        self._session.trust_env = False
+        if self._proxy_url:
+            self._session.proxies.update({
+                "http": self._proxy_url,
+                "https": self._proxy_url,
+            })
         self._session.headers.update({
             "User-Agent": _DEFAULT_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -486,6 +495,7 @@ class SitePool:
         timeout: int = 20,
         prefer_direct: bool = True,
         cooldown: int = 300,
+        proxy_url: str = "",
     ) -> None:
         seen = set()
         self.clients: List[SiteClient] = []
@@ -494,7 +504,9 @@ class SitePool:
             if not url or url in seen:
                 continue
             seen.add(url)
-            self.clients.append(SiteClient(url, flaresolverr, timeout, prefer_direct))
+            self.clients.append(SiteClient(
+                url, flaresolverr, timeout, prefer_direct, proxy_url=proxy_url
+            ))
         if not self.clients:
             raise ValueError("SitePool needs at least one base URL")
 

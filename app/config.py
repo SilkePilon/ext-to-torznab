@@ -33,6 +33,11 @@ class Config:
     # Challenge solver URL – FlareSolverr or Byparr (leave empty to disable)
     FLARESOLVERR_URL: str = os.environ.get("FLARESOLVERR_URL", "http://localhost:8191")
 
+    # Optional HTTP(S) proxy for both the direct site client and the solver
+    # browser. Both paths must share the same egress IP, or the Cloudflare
+    # clearance will be rejected on the next direct request.
+    PROXY_URL: str = os.environ.get("PROXY_URL", "").strip()
+
     # Which solver speaks at FLARESOLVERR_URL: "flaresolverr" (browser
     # sessions + request.post), "byparr" (one throw-away browser per call,
     # no sessions, no browser POST) or "auto" (probe GET / once, lazily).
