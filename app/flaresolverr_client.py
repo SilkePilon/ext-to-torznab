@@ -80,6 +80,7 @@ class FlareSolverrClient:
         reaper_interval: float = 30.0,
         session_ttl_minutes: int = 0,
         backend: str = "auto",
+        proxy_url: str = "",
     ) -> None:
         backend = (backend or "auto").strip().lower()
         if backend not in BACKENDS:
@@ -92,11 +93,15 @@ class FlareSolverrClient:
         self._http_timeout = timeout_ms / 1_000 + 15
         self._tabs_till_verify = tabs_till_verify
         self._session_ttl_minutes = max(0, session_ttl_minutes)
+        self._proxy_url = (proxy_url or "").strip()
         self._session_id: Optional[str] = None
         self._backend: Optional[str] = None if backend == "auto" else backend
         # Keep-alive to the solver container instead of a new TCP
         # connection per command.
         self._http = requests.Session()
+        # The solver is normally on localhost; never send that call through
+        # the ext.to proxy.
+        self._http.trust_env = False
         # Serialise session creation/destruction so concurrent threads can't
         # race and create multiple browser sessions simultaneously.
         self._session_lock = threading.Lock()
@@ -316,6 +321,10 @@ class FlareSolverrClient:
             payload["session"] = self._session_id
         if self._tabs_till_verify > 0 and self.supports_sessions:
             payload["tabs_till_verify"] = self._tabs_till_verify
+        # FlareSolverr accepts a per-request proxy. Byparr uses its own
+        # PROXY_SERVER environment variable, so do not inject this field there.
+        if self._proxy_url and self.backend == "flaresolverr":
+            payload["proxy"] = {"url": self._proxy_url}
         return payload
 
     # ------------------------------------------------------------------
